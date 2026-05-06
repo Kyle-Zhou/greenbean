@@ -18,6 +18,7 @@ import pkgutil
 from greenbean.connectors.github import (
     GitHubConnector,
     GitHubCredentials,
+    GitHubRepoInfo,
     GitHubWriter,
     WebhookNotifier,
 )
@@ -25,9 +26,14 @@ from greenbean.core.connectors import (
     ChangeNotifier,
     Connector,
     RepoCredentials,
+    RepoRef,
     RepoWriter,
     SupportsPullRequests,
 )
+
+
+async def _stub_resolver(_: RepoRef) -> GitHubRepoInfo:
+    return GitHubRepoInfo(installation_id=1, owner="acme", name="widgets")
 
 
 def _assignable(value: object, protocol: type) -> bool:
@@ -46,7 +52,11 @@ def _assignable(value: object, protocol: type) -> bool:
 
 
 def test_github_credentials_satisfies_repo_credentials() -> None:
-    instance = GitHubCredentials(app_id="1", private_key=b"")
+    instance = GitHubCredentials(
+        app_id="1",
+        private_key=b"",
+        repo_resolver=_stub_resolver,
+    )
     assert _assignable(instance, RepoCredentials)
 
 
@@ -71,6 +81,7 @@ def test_github_connector_satisfies_connector_protocol() -> None:
         app_id="1",
         private_key=b"",
         webhook_secret="secret",
+        repo_resolver=_stub_resolver,
     )
     assert _assignable(connector, Connector)
     assert connector.name == "github"

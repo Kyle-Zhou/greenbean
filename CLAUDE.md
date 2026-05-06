@@ -8,6 +8,12 @@ An agentic platform that keeps a repository's documentation continuously in sync
 
 See `architecture.md` for the full design. This file is the operating manual for working in the codebase.
 
+## Current build frontier
+
+v1 ships **single-tenant CLI mode first.** The entry point is `greenbean clone <url> [--token $PAT]` (`src/greenbean/cli.py`); credentials go through `TokenCredentials` (`connectors/github/token_credentials.py`); the working copy lands under `~/.greenbean/cache/<host>/<owner>/<name>/`. This is the path the agent and tool layers will operate on as those steps come online — `architecture.md` §12 has the full ordering.
+
+**Multi-tenant SaaS infra is deferred.** `GitHubCredentials` (App + JWT + installation-token mint) is scaffolded but inactive; webhooks, reconciliation cron, advisory locks, Postgres-backed working-copy cache, and per-tenant disk isolation are explicitly *not* built yet — they're step 6 of the build order, gated on the agent demonstrably producing docs that get merged. **Don't add tenant-aware plumbing in core paths until then.** If a change feels like it's "for when we go multi-tenant," push back on the timing and flag it on the PR.
+
 ## Design principles (non-negotiable)
 
 These are the spine of the system. Don't violate them without an explicit conversation:
@@ -31,7 +37,7 @@ Connection → Sync → Planning → Triage → Agent Runtime → Publishing
 (Git service is shared across Sync, Planning, and Agent Runtime)
 ```
 
-- **Connection Layer** — `ChangeNotifier`, `RepoCredentials`, `RepoWriter`. v1: GitHub implementations. Only platform-specific things (auth, webhooks, PR creation) live here — *not* file reads, diffs, or commit lookups; those are Git operations on a working copy. Optional capabilities (`SupportsCheckRuns`, etc.) are feature-detected, not assumed.
+- **Connection Layer** — `ChangeNotifier`, `RepoCredentials`, `RepoWriter`. Two `RepoCredentials` impls live side by side: `TokenCredentials` (BYO PAT, what the CLI uses today) and `GitHubCredentials` (GitHub App + JWT, scaffolded for SaaS). Only platform-specific things (auth, webhooks, PR creation) live here — *not* file reads, diffs, or commit lookups; those are Git operations on a working copy. Optional capabilities (`SupportsCheckRuns`, etc.) are feature-detected, not assumed.
 - **Git service** — thin shell-out wrapper around `git` (or libgit2). Used by sync, planning, and the tool layer. Not part of the connector — same on every platform.
 - **Sync Layer** — receives change events (webhook + reconciliation), manages the per-tenant working-copy cache, computes diffs, tracks `last_synced_sha`. Idempotent on `(repo_id, after_sha)`.
 - **Planning** — maintains the doc plan and the source-to-doc map; resolves a diff to a candidate set of affected docs. Lightweight, mostly mechanical.

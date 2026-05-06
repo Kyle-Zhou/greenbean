@@ -156,7 +156,16 @@ Implementation: shell out to `git` for v1. It's well-debugged, performant, and h
 
 **Auth model.** GitHub App. Customer installs the app on selected repos; we receive an installation ID and mint short-lived installation tokens per operation. Tokens are held in memory only, never written to disk. No long-lived PATs.
 
-### 3.5 What this means for future local-agent support
+### 3.5 Two credential modes (App vs token)
+
+The connection layer ships two `RepoCredentials` implementations. Both satisfy the same protocol; the orchestrator picks one at construction time.
+
+- **`TokenCredentials` — CLI / single-tenant (what v1 ships first).** Operator (or developer) brings a personal access token. No JWT, no installation-token mint — the PAT *is* the credential, embedded as `https://x-access-token:{token}@github.com/{owner}/{name}.git`. Powers the `greenbean clone` CLI in §12 step 1; the entire purpose is to let us dogfood the agent on real repos without first standing up the GitHub App apparatus. Token is read from `--token` or `$GITHUB_TOKEN` and is redacted from any `GitError` log line by `_redact()` in `core/git.py`.
+- **`GitHubCredentials` — App mode, multi-tenant SaaS.** The model described in §3.4 above. Scaffolded today (JWT signing + installation-token exchange + `repo_resolver` plumbing) but not the immediate focus. Comes online once agent quality is proven on real repos via CLI mode — see §12 step 6.
+
+This is the payoff for keeping the connector slim: both modes drop in without touching core, and the writer surface can correspondingly evolve from "PAT in push URL" → "App-minted installation token" → "shell out to `gh pr create`" depending on deployment.
+
+### 3.6 What this means for future local-agent support
 
 The slimmer interface is *better* for the local-agent case, not worse. A local-agent connector implements:
 
@@ -527,16 +536,17 @@ This is the right architecture for security-conscious customers who can't accept
 
 ## 12. Build Order
 
-Roughly the sequence to actually ship in:
+Roughly the sequence to actually ship in. v1 prioritizes a single-tenant CLI we can dogfood ASAP; multi-tenant SaaS infra is gated on the agent demonstrably producing docs that get merged.
 
-1. **Connection layer + Git service + sync layer.** GitHub App (auth, webhook receiver, RepoCredentials, RepoWriter), the Git service shell-out wrapper, working-copy cache, idempotency, reconciliation cron. End state: we know when a repo changes and we have its files on disk, with proper tenant isolation.
-2. **Tool layer.** All the read/grep/find_symbol/git tools, well-tested in isolation against the working copy. This is the foundation for everything downstream — both generation and Q&A use it.
-3. **Planning service.** Initial doc plan from a default template, source-to-doc map (mechanical, derived from imports + plan), diff-to-affected-docs query. Keep this small.
-4. **Generator agent — narrow scope first.** Only READMEs and a top-level architecture doc. End state: real docs being committed via PR for one or two design-partner customers.
+1. **CLI mode + Git service. *(done — see `cli.py`, `TokenCredentials`, `GitService`.)*** `greenbean clone <url>` against a remote with a user-supplied PAT, shell-out wrapper around `git`, persistent on-disk working-copy cache under `~/.greenbean/cache/`. End state: a developer can run greenbean against any repo they hold a token for. No Postgres, no webhooks, no tenant isolation yet — those come in step 6.
+2. **Tool layer.** All the read/grep/find_symbol/git tools, well-tested in isolation against a working copy. The foundation for everything downstream — both generation and Q&A use it.
+3. **Planning service (single-tenant).** Initial doc plan from a default template, source-to-doc map (mechanical, derived from imports + plan), diff-to-affected-docs query. While we're CLI-only, storage is a local SQLite or JSON file under `~/.greenbean/`; Postgres comes with step 6.
+4. **Generator agent — narrow scope first.** Only READMEs and a top-level architecture doc. End state: real docs being committed via PR for one or two design-partner customers running the CLI on their own repo.
 5. **Triage classifier and validator.** Now that docs exist, optimize the regeneration loop (so most pushes don't trigger expensive generation) and harden against hallucinated symbols / broken examples.
-6. **Doc plan expansion.** Add reference docs for public APIs, then conceptual docs. Each doc type is its own quality investment.
-7. **Q&A endpoint.** Built on the existing tool layer + doc embeddings. This is where the modularity pays back.
-8. **Local-agent connector.** Once enough security-conscious customers ask for it.
-9. **Optional optimizations.** Symbol/dep-graph caching behind the tool interface, only if profiling proves the agent's on-demand discovery is the bottleneck.
+6. **App mode + multi-tenant sync layer.** GitHub App auth (`GitHubCredentials` is already scaffolded), webhook receiver, Postgres-backed working-copy cache under `/var/lib/...`, idempotency on `(repo_id, after_sha)`, advisory locks, reconciliation cron, per-tenant disk quotas. End state: customers install via GitHub App; pushes trigger jobs; multiple tenants share infrastructure safely. **This is the gate from "CLI dogfood" to "SaaS product"** — only worth crossing once steps 4–5 prove people merge the docs.
+7. **Doc plan expansion.** Add reference docs for public APIs, then conceptual docs. Each doc type is its own quality investment.
+8. **Q&A endpoint.** Built on the existing tool layer + doc embeddings. This is where the modularity pays back.
+9. **Local-agent connector.** For security-conscious customers who can't accept a hosted clone of their repo. Architecturally additive — see §10.
+10. **Optional optimizations.** Symbol/dep-graph caching behind the tool interface, only if profiling proves the agent's on-demand discovery is the bottleneck.
 
-The single highest-leverage thing to nail in the first four steps is the **source-to-doc map + targeted regeneration**. That's what makes the system feel like it actually understands the codebase rather than blindly rewriting docs whenever code changes — and it's what justifies the whole agentic framing in the first place.
+The single highest-leverage thing to nail in steps 1–4 is the **source-to-doc map + targeted regeneration**. That's what makes the system feel like it actually understands the codebase rather than blindly rewriting docs whenever code changes — and it's what justifies the whole agentic framing in the first place.

@@ -7,13 +7,23 @@ service, which is platform-agnostic.
 """
 
 from greenbean.connectors.github.connector import GitHubConnector
-from greenbean.connectors.github.credentials import GitHubCredentials
+from greenbean.connectors.github.credentials import (
+    GitHubCredentials,
+    GitHubCredentialsError,
+    GitHubRepoInfo,
+    GitHubRepoResolver,
+)
 from greenbean.connectors.github.notifier import WebhookNotifier
+from greenbean.connectors.github.token_credentials import TokenCredentials
 from greenbean.connectors.github.writer import GitHubWriter
 
 __all__ = [
     "GitHubConnector",
     "GitHubCredentials",
+    "GitHubCredentialsError",
+    "GitHubRepoInfo",
+    "GitHubRepoResolver",
     "GitHubWriter",
+    "TokenCredentials",
     "WebhookNotifier",
 ]
