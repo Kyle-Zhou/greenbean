@@ -6,11 +6,11 @@ Guidance for Claude (and other agentic coding tools) working in this repository.
 
 An agentic platform that keeps a repository's documentation continuously in sync with its code. When code changes, the system detects which docs are affected, regenerates them with an LLM-driven agent, validates the output, and publishes the result back to the repo as a pull request. The same engine doubles as a Q&A agent over the codebase and its docs.
 
-See `architecture.md` for the full design. This file is the operating manual for working in the codebase.
+See `Architecture.md` for the full design. This file is the operating manual for working in the codebase.
 
 ## Current build frontier
 
-v1 ships **single-tenant CLI mode first.** The entry point is `greenbean clone <url> [--token $PAT]` (`src/greenbean/cli.py`); credentials go through `TokenCredentials` (`connectors/github/token_credentials.py`); the working copy lands under `~/.greenbean/cache/<host>/<owner>/<name>/`. This is the path the agent and tool layers will operate on as those steps come online — `architecture.md` §12 has the full ordering.
+v1 ships **single-tenant CLI mode first.** The entry point is `greenbean clone <url> [--token $PAT]` (`src/greenbean/cli.py`); credentials go through `TokenCredentials` (`connectors/github/token_credentials.py`); the working copy lands under `~/.greenbean/cache/<host>/<owner>/<name>/`. This is the path the agent and tool layers will operate on as those steps come online — `Architecture.md` §12 has the full ordering.
 
 **Multi-tenant SaaS infra is deferred.** `GitHubCredentials` (App + JWT + installation-token mint) is scaffolded but inactive; webhooks, reconciliation cron, advisory locks, Postgres-backed working-copy cache, and per-tenant disk isolation are explicitly *not* built yet — they're step 6 of the build order, gated on the agent demonstrably producing docs that get merged. **Don't add tenant-aware plumbing in core paths until then.** If a change feels like it's "for when we go multi-tenant," push back on the timing and flag it on the PR.
 
@@ -115,7 +115,7 @@ If a feature request points at one of these, push back or scope it down. The poi
 
 ## Pointers
 
-- `architecture.md` — full system design, including build order
+- `Architecture.md` — full system design, including build order
 - `docs/adr/` — architectural decision records (create this when you make the first one)
 - `docs/prompts/` — versioned prompts and templates (create when needed)
 

@@ -1,5 +1,7 @@
 """GitHub connector — v1.
 
+GitHub-specific implementations for the connection interfaces.
+
 Implements the three core interfaces against a GitHub-hosted repo using a
 GitHub App installation for auth. File reads, diffs, and tree listings are
 *not* here — they are Git operations on a working copy and live in the Git
