@@ -3,7 +3,7 @@
 These tests guard two invariants:
 
 1. The v1 GitHub stubs structurally satisfy the core protocols. If someone
-   adds a new method to ``RepoSource`` and forgets to update the GitHub
+   adds a new method to ``RepoCredentials`` and forgets to update the GitHub
    implementation, this catches it before it reaches a runtime call site.
 2. The dependency arrow points connectors → core, never the reverse. The
    core package must remain importable without the connectors package even
@@ -14,18 +14,17 @@ from __future__ import annotations
 
 import importlib
 import pkgutil
-from pathlib import Path
 
 from greenbean.connectors.github import (
     GitHubConnector,
+    GitHubCredentials,
     GitHubWriter,
-    GitRepoSource,
     WebhookNotifier,
 )
 from greenbean.core.connectors import (
     ChangeNotifier,
     Connector,
-    RepoSource,
+    RepoCredentials,
     RepoWriter,
     SupportsPullRequests,
 )
@@ -46,9 +45,9 @@ def _assignable(value: object, protocol: type) -> bool:
     return True
 
 
-def test_git_repo_source_satisfies_repo_source() -> None:
-    instance = GitRepoSource(cache_root=Path("/tmp/greenbean-test"))
-    assert _assignable(instance, RepoSource)
+def test_github_credentials_satisfies_repo_credentials() -> None:
+    instance = GitHubCredentials(app_id="1", private_key=b"")
+    assert _assignable(instance, RepoCredentials)
 
 
 def test_webhook_notifier_satisfies_change_notifier() -> None:
@@ -69,15 +68,14 @@ def test_github_writer_advertises_pull_request_capability() -> None:
 
 def test_github_connector_satisfies_connector_protocol() -> None:
     connector = GitHubConnector(
-        cache_root=Path("/tmp/greenbean-test"),
         app_id="1",
         private_key=b"",
         webhook_secret="secret",
     )
     assert _assignable(connector, Connector)
     assert connector.name == "github"
-    assert _assignable(connector.source, RepoSource)
     assert _assignable(connector.notifier, ChangeNotifier)
+    assert _assignable(connector.credentials, RepoCredentials)
     assert _assignable(connector.writer, RepoWriter)
 
 

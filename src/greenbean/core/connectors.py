@@ -1,19 +1,25 @@
 """Connection-layer interfaces.
 
-These are the contracts every connector implements. The core orchestrator
-talks to platforms (GitHub today, GitLab / local agent tomorrow) only through
-these protocols.
+The connector exposes only what's *genuinely platform-specific* — the things a
+hosting platform does that ``git`` alone can't. Everything else (reading
+files, diffing, listing trees, inspecting commits) is a ``git`` operation on
+the working copy and lives in a separate Git service, not here.
 
-Capabilities that not every host can support — pull requests, check runs,
-commit comments — live in separate ``Supports*`` protocols. Core code
-feature-detects with ``isinstance`` rather than assuming.
+Three small interfaces, each doing one platform-specific thing:
+
+- ``ChangeNotifier`` — emits change events when a tracked branch advances.
+- ``RepoCredentials`` — mints platform auth and answers branch-HEAD lookups.
+- ``RepoWriter`` — publishes generated docs back to the customer's repo.
+
+Optional capabilities (check runs, commit comments, PR reviews) live in
+separate ``Supports*`` protocols. Core code feature-detects with
+``isinstance``; it must never assume any of them.
 """
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Protocol, runtime_checkable
 
 # ---------------------------------------------------------------------------
@@ -36,33 +42,13 @@ class RepoRef:
 
 
 @dataclass(frozen=True, slots=True)
-class Commit:
-    sha: str
-    author: str
-    message: str
-    timestamp: datetime
-    parents: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class FileChange:
-    """A single path's diff between two refs."""
-
-    path: str
-    status: str  # "added" | "modified" | "removed" | "renamed"
-    old_blob: bytes | None
-    new_blob: bytes | None
-    old_path: str | None = None  # set when ``status == "renamed"``
-
-
-@dataclass(frozen=True, slots=True)
 class ChangeEvent:
     """Emitted by a ``ChangeNotifier`` when a repo's tracked ref advances."""
 
     repo: RepoRef
     ref: str
-    from_sha: str | None  # ``None`` for the very first event on a repo
-    to_sha: str
+    before_sha: str | None  # ``None`` for the very first event on a repo
+    after_sha: str
     triggered_by: str  # e.g. "webhook", "reconciliation", "manual"
 
 
@@ -77,44 +63,44 @@ class FileToWrite:
 # ---------------------------------------------------------------------------
 
 
-class RepoSource(Protocol):
-    """Read-only access to a repository's contents and history."""
-
-    async def get_file(self, repo: RepoRef, path: str, ref: str) -> bytes: ...
-
-    async def list_tree(self, repo: RepoRef, ref: str) -> Sequence[str]: ...
-
-    async def diff(
-        self,
-        repo: RepoRef,
-        from_sha: str,
-        to_sha: str,
-    ) -> Sequence[FileChange]: ...
-
-    async def get_commit(self, repo: RepoRef, sha: str) -> Commit: ...
-
-    async def get_default_branch(self, repo: RepoRef) -> str: ...
-
-
 ChangeCallback = Callable[[ChangeEvent], Awaitable[None]]
 
 
 class ChangeNotifier(Protocol):
     """Push-based source of repo change events.
 
-    Implementations must deliver events idempotently keyed on
-    ``(repo.id, to_sha)`` — webhooks retry, reconciliation jobs may re-emit.
-    Deduplication is the orchestrator's job, but notifiers should not invent
-    spurious change events.
+    Implementations register a single global handler; the orchestrator
+    dispatches downstream. Events must be delivered idempotently keyed on
+    ``(repo.id, after_sha)`` — webhooks retry, reconciliation jobs may re-emit
+    the same event. Deduplication is the orchestrator's job, but notifiers
+    should not invent spurious events.
     """
 
-    async def subscribe(self, repo: RepoRef, callback: ChangeCallback) -> None: ...
+    async def subscribe(self, callback: ChangeCallback) -> None: ...
 
-    async def unsubscribe(self, repo: RepoRef) -> None: ...
+    async def unsubscribe(self, callback: ChangeCallback) -> None: ...
+
+
+class RepoCredentials(Protocol):
+    """Platform-specific things needed to interact with a repo.
+
+    The clone URL is short-lived and intended for sync-time clone/fetch only;
+    callers must not persist it. The branch-head lookup is what reconciliation
+    uses to detect drift between the actual remote HEAD and our recorded
+    ``last_synced_sha``.
+    """
+
+    async def get_clone_url(self, repo: RepoRef) -> str:
+        """Return a short-lived authenticated URL for cloning or fetching."""
+        ...
+
+    async def get_branch_head(self, repo: RepoRef, branch: str) -> str:
+        """Return the commit SHA that ``branch`` currently points at on the host."""
+        ...
 
 
 class RepoWriter(Protocol):
-    """Write access for publishing generated docs back to the customer's repo.
+    """Publishes generated docs back to the customer's repo.
 
     The required surface is intentionally minimal: open a pull request with a
     set of file writes. Connectors that do not natively support PRs (e.g. a
@@ -187,6 +173,19 @@ class SupportsCommitComments(Protocol):
     ) -> None: ...
 
 
+@runtime_checkable
+class SupportsPullRequestReviews(Protocol):
+    """Host supports posting structured PR reviews (approve / request changes / comment)."""
+
+    async def post_pull_request_review(
+        self,
+        repo: RepoRef,
+        pr_number: int,
+        event: str,  # "APPROVE" | "REQUEST_CHANGES" | "COMMENT"
+        body: str,
+    ) -> None: ...
+
+
 # ---------------------------------------------------------------------------
 # Connector aggregate
 # ---------------------------------------------------------------------------
@@ -196,18 +195,18 @@ class Connector(Protocol):
     """Bundle of the three required interfaces for one host.
 
     A connector is the unit a customer enables — "GitHub", "Local Agent" — and
-    it composes a ``RepoSource``, a ``ChangeNotifier`` and a ``RepoWriter``.
-    Optional capabilities are discovered via ``isinstance`` checks against the
-    individual components.
+    it composes a ``ChangeNotifier``, a ``RepoCredentials`` and a
+    ``RepoWriter``. Optional capabilities are discovered via ``isinstance``
+    checks against the individual components.
     """
 
     name: str  # e.g. "github"
 
     @property
-    def source(self) -> RepoSource: ...
+    def notifier(self) -> ChangeNotifier: ...
 
     @property
-    def notifier(self) -> ChangeNotifier: ...
+    def credentials(self) -> RepoCredentials: ...
 
     @property
     def writer(self) -> RepoWriter: ...

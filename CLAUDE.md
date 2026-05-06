@@ -12,8 +12,8 @@ See `architecture.md` for the full design. This file is the operating manual for
 
 These are the spine of the system. Don't violate them without an explicit conversation:
 
-1. **The connection layer is modular.** v1 ships GitHub-hosted only, but the abstraction must support future local-agent and other-host connectors. Anything platform-specific (PRs, webhooks, GitHub auth) lives behind the connector interface — never in the core.
-2. **The repo is the published surface; Postgres is the operational substrate.** Customer-facing docs are Markdown committed to the customer's repo via PR. Everything *about* docs (plan, dep graph, generation metadata, embeddings) lives in Postgres. Don't blur this line.
+1. **The connector is *only* what's platform-specific.** v1 ships GitHub-hosted only, but the abstraction must support future local-agent and other-host connectors. What lives behind the connector: auth, change notifications, PR creation, branch HEAD lookups. What does *not* live behind the connector: file reads, diffs, tree listings, commit metadata — those are `git` operations on a working copy, and `git` is already a perfectly good abstraction for them. If you find yourself adding a connector method to do something `git` already does, that's the wrong layer.
+2. **The repo is the published surface; Postgres is the operational substrate.** Customer-facing docs are Markdown committed to the customer's repo via PR. Everything *about* docs (doc plan, source-to-doc map, generation metadata, embeddings, sync state) lives in Postgres. Don't blur this line.
 3. **Grep beats RAG for code.** Structured search (ripgrep, tree-sitter, git) is the primary retrieval mechanism. Embeddings are a supplementary navigation aid for when the agent doesn't yet know what to search for. Don't reach for vector search as a default.
 4. **Generation is a function of change, not of code.** Steady-state runs are "main moved from SHA A to SHA B; what changes?" Avoid full-repo regenerations except on initial onboarding.
 5. **No execution of customer code in v1.** Read-only static analysis only — `read`, `grep`, `git log`, tree-sitter. No `npm install`, no running scripts, no test execution. Crossing this line requires real sandboxing infra and an explicit decision.
@@ -23,19 +23,25 @@ These are the spine of the system. Don't violate them without an explicit conver
 ## Architectural shape
 
 ```
-Connection Layer  →  Sync Orchestrator  →  Comprehension Engine  →  Agent Runtime  →  Publishing
-                                                                          │
-                                                                          ▼
-                                                                       Q&A API
+Connection → Sync → Planning → Triage → Agent Runtime → Publishing
+                                              │
+                                              ▼
+                                          Q&A API
+
+(Git service is shared across Sync, Planning, and Agent Runtime)
 ```
 
-- **Connection Layer** — `RepoSource`, `ChangeNotifier`, `RepoWriter` interfaces. v1: GitHub implementations. Optional capabilities (`SupportsPullRequests`, etc.) are feature-detected, not assumed.
-- **Sync Orchestrator** — receives change events, manages the working-copy cache, tracks `last_synced_sha`, enqueues generation jobs.
-- **Comprehension Engine** — tree-sitter symbol extraction, dependency graph, doc plan, source-to-doc index. **No LLMs in this stage.**
-- **Agent Runtime** — tool layer, triage classifier (cheap model), generator (capable model), validator. Same runtime serves doc generation and Q&A with different prompts.
-- **Publishing** — PR builder + writer, batched per generation job.
+- **Connection Layer** — `ChangeNotifier`, `RepoCredentials`, `RepoWriter`. v1: GitHub implementations. Only platform-specific things (auth, webhooks, PR creation) live here — *not* file reads, diffs, or commit lookups; those are Git operations on a working copy. Optional capabilities (`SupportsCheckRuns`, etc.) are feature-detected, not assumed.
+- **Git service** — thin shell-out wrapper around `git` (or libgit2). Used by sync, planning, and the tool layer. Not part of the connector — same on every platform.
+- **Sync Layer** — receives change events (webhook + reconciliation), manages the per-tenant working-copy cache, computes diffs, tracks `last_synced_sha`. Idempotent on `(repo_id, after_sha)`.
+- **Planning** — maintains the doc plan and the source-to-doc map; resolves a diff to a candidate set of affected docs. Lightweight, mostly mechanical.
+- **Triage Classifier** — cheap model that gates the expensive generator: `regenerate | targeted_edit | no_op` per candidate.
+- **Agent Runtime** — tool layer (read/grep/find_symbol/git, on-demand discovery), generator (capable model, agentic loop), validator. Same runtime serves doc generation and Q&A with different prompts.
+- **Publishing** — PR builder + writer, batched per generation cycle.
 
 Schema, exact file layout, language choices, and prompt structure are deliberately not pinned here. They will evolve. The interfaces between layers are what matters.
+
+**What's deliberately *not* a separate layer.** Earlier drafts had a "Comprehension Engine" doing symbol extraction and dep-graph construction over the entire repo on every push. That's been pushed down into the agent's tool layer as on-demand discovery via tree-sitter and ripgrep. If profiling later shows we need caching, it goes behind the tool interface — not as a separate upstream stage.
 
 ## Code organization (loose; refactor freely)
 

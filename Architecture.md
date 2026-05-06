@@ -8,8 +8,9 @@ A platform that keeps a repository's documentation continuously in sync with its
 
 - **Connection layer is modular.** v1 ships GitHub-only (server-hosted), but the abstraction supports future local-agent and other-host (GitLab, Bitbucket) implementations without rewriting the core.
 - **Code stays where it belongs.** Docs are published to the customer's repo as Markdown via PR. The customer owns their docs and can leave at any time with no export step.
-- **Postgres is the operational substrate.** Generation metadata, dependency graphs, embeddings, and analytics live server-side. The repo is the published surface; Postgres is the truth about system state.
+- **Postgres is the operational substrate.** The doc plan, source-to-doc map, generation metadata, embeddings, and analytics live server-side. The repo is the published surface; Postgres is the truth about system state.
 - **Grep beats RAG for code.** Agents discover the codebase through structured search (ripgrep, tree-sitter, git) on a server-cached working copy. Embeddings are a supplementary navigation aid, not the primary retrieval mechanism.
+- **On-demand discovery before precomputed indexes.** The agent's tool layer runs tree-sitter and ripgrep at query time. Precomputed symbol/dep caches are an optimization we add only if profiling demands it.
 - **Generation is a function of change, not of code.** The system maintains a doc corpus over time. Each run is "main moved from SHA A to SHA B; what changes?"
 - **Show your work.** Every PR explains what changed, why, and what source drove the update.
 
@@ -28,40 +29,47 @@ A platform that keeps a repository's documentation continuously in sync with its
 │   ┌──────────────────────┐    ┌────────────────────────────────┐    │
 │   │  GitHubConnector     │    │  (future) LocalAgentConnector  │    │
 │   │  - WebhookNotifier   │    │  - FilesystemWatcher           │    │
-│   │  - GitRepoSource     │    │  - GitRepoSource               │    │
-│   │  - GitHubWriter (PR) │    │  - LocalWriter                 │    │
+│   │  - RepoCredentials   │    │  - RepoCredentials (no-op)     │    │
+│   │  - RepoWriter (PR)   │    │  - LocalWriter                 │    │
 │   └──────────┬───────────┘    └────────────────────────────────┘    │
+│         (Git service is shared, not part of the connector)           │
 └──────────────┼──────────────────────────────────────────────────────┘
                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                          Sync Orchestrator                           │
-│  - Receives change events                                            │
-│  - Manages working-copy cache                                        │
-│  - Tracks last_synced_sha per repo                                   │
-│  - Enqueues generation jobs                                          │
+│                            Sync Layer                                │
+│  - Receives change events (webhook + reconciliation cron)            │
+│  - Manages working-copy cache (per-tenant disk isolation)            │
+│  - Computes diffs, tracks last_synced_sha                            │
+│  - Hands off to Planning                                             │
 └──────────────┬──────────────────────────────────────────────────────┘
                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                       Comprehension Engine                           │
-│  - Symbol extraction (tree-sitter)                                   │
-│  - Dependency graph builder                                          │
-│  - Doc plan maintainer                                               │
-│  - Source-to-doc dependency index                                    │
+│                             Planning                                 │
+│  - Maintains the doc plan (which docs should exist for this repo)    │
+│  - Maintains the source-to-doc dependency map                        │
+│  - Resolves the diff to a candidate set of affected docs             │
+│  - Lightweight: mostly mechanical, occasional small-LLM call         │
 └──────────────┬──────────────────────────────────────────────────────┘
                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                          Agent Runtime                               │
+│                         Triage Classifier                            │
+│  - Cheap model: regenerate | targeted_edit | no_op per candidate     │
+│  - Gates the expensive generator                                     │
+└──────────────┬──────────────────────────────────────────────────────┘
+               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│              Agent Runtime (one job per surviving doc)               │
 │  - Tool layer (read/grep/find_symbol/git/semantic_search)            │
-│  - Planner / classifier (cheap model)                                │
+│       on-demand discovery via tree-sitter and ripgrep                │
 │  - Generator (capable model, agentic loop)                           │
 │  - Validator (tsc/ast parse, symbol resolution, link check)          │
 └──────────────┬──────────────────────────────────────────────────────┘
                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                     Publishing & Storage Layer                       │
-│  - Postgres (metadata, plan, dep graph, pgvector index)              │
-│  - Working-copy cache (cloned repos on disk)                         │
-│  - PR builder + writer                                               │
+│  - Postgres (doc plan, source-to-doc map, metadata, pgvector)        │
+│  - Working-copy cache (cloned repos on disk, ephemeral)              │
+│  - PR builder + writer (batched per generation cycle)                │
 └─────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -70,103 +78,163 @@ A platform that keeps a repository's documentation continuously in sync with its
                        └─────────────┘
 ```
 
+**Note on what's *not* a separate layer anymore.** Earlier drafts had a "Comprehension Engine" between sync and agent, responsible for symbol extraction, dep graph construction, and the doc plan. Two of those three responsibilities turned out to be optimizations rather than essential infrastructure. Symbol maps and import graphs are useful, but tree-sitter and ripgrep are fast enough that the agent can build what it needs on-demand via its tool layer. What *is* essential — the doc plan and the source-to-doc map — is small enough to live as a thin Planning service rather than an "engine." If profiling later shows on-demand discovery is too slow or too expensive, the tool layer is the right place to add caching without changing anything upstream.
+
 ---
 
 ## 3. Connection Layer
 
-The connection layer is an abstraction with two sub-interfaces. v1 implements both for GitHub-hosted repos.
+The connector exposes only what's *genuinely platform-specific* — the things a hosting platform does that `git` alone can't. Everything else (reading files, diffing, listing trees, inspecting commits) is a `git` operation on the working copy and lives in a separate `Git` service, not the connector.
 
-### 3.1 Interfaces
+### 3.1 What's in the connector
 
-**`RepoSource`** — read access to a repo's contents and history.
+Three small interfaces, each doing one platform-specific thing:
 
-```
-get_file(path, ref) -> bytes
-list_tree(ref) -> [paths]
-diff(from_sha, to_sha) -> [{path, status, old_blob, new_blob}]
-get_commit(sha) -> {author, message, timestamp, parents}
-get_default_branch() -> ref
-```
-
-**`ChangeNotifier`** — tells the orchestrator when a repo has changed.
+**`ChangeNotifier`** — emits change events when a repo's tracked branch moves.
 
 ```
-subscribe(repo_id, callback)
+subscribe(handler)
+  ─ emits: {repo_id, before_sha, after_sha, ref}
 ```
 
-Implementations push events of shape `{repo_id, from_sha, to_sha, ref, triggered_by}`.
+GitHub implementation: webhook receiver with signature verification.
+Future local-agent implementation: filesystem watcher on `.git/refs/heads/{branch}`.
 
-**`RepoWriter`** — write access for publishing docs.
+**`RepoCredentials`** — provides the platform-specific things needed to interact with a repo.
 
 ```
-open_pull_request(repo_id, branch_name, files: [{path, content}], title, body) -> pr_url
+get_clone_url(repo_id) -> authenticated URL   # short-lived, for sync-time clone/fetch
+get_branch_head(repo_id, branch) -> sha       # for reconciliation drift checks
 ```
+
+GitHub implementation: mints short-lived installation tokens, calls the GitHub API for branch HEAD. Future local-agent implementation: `get_clone_url` is a no-op (repo already on disk); `get_branch_head` is a local `git rev-parse`.
+
+**`RepoWriter`** — publishes docs.
+
+```
+open_pull_request(repo_id, branch, files, title, body) -> pr_url
+```
+
+GitHub implementation: pushes the branch via git, opens a PR via the GitHub API. Future local-agent implementation: writes a branch locally and either lets the user push or shells out to `gh pr create`.
 
 **Optional capability interfaces** (connectors implement what they support):
-- `SupportsPullRequests`
 - `SupportsCheckRuns`
 - `SupportsCommitComments`
+- `SupportsPullRequestReviews`
 
-The core never assumes these exist; it feature-detects.
+The core feature-detects rather than assuming.
 
-### 3.2 v1 implementations
+### 3.2 What's *not* in the connector
 
-- **`GitHubConnector.WebhookNotifier`** — receives `push` webhooks, validates signature, emits change events.
-- **`GitRepoSource`** — operates on a working-copy cache directory. Same implementation reused later for local-agent connectors.
-- **`GitHubWriter`** — uses GitHub App installation token to create branch, commit, and open PR.
+The original draft of this layer had a much larger `RepoSource` interface with `get_file`, `list_tree`, `diff`, `get_commit`, etc. Those are gone — they were a category mistake. They're operations on a Git repository, not on a hosting platform. Once we have a working copy on disk (which the sync layer maintains), `git` itself answers all of them, and going through a connector abstraction would route filesystem access through a network-shaped interface for no reason.
 
-**Auth model.** GitHub App per Anthropic-style installation. Customer installs the app on selected repos; we receive an installation ID and mint short-lived installation tokens per operation. No long-lived PATs.
+Concretely: when the agent needs to read a file, it goes to the tool layer (`read_file`) which goes to the filesystem. It does not go through the connector. When the planner needs a diff, it asks the Git service. It does not call the connector.
+
+### 3.3 The `Git` service
+
+A thin wrapper around `git` (or a library — go-git, libgit2, isomorphic-git) that operates on working copies. Used by sync, planning, and the tool layer alike. Not part of the connection abstraction; it's the same on every platform.
+
+```
+clone(url, dest, depth)
+fetch(repo_path)
+reset_hard(repo_path, sha)
+diff(repo_path, from_sha, to_sha) -> [{path, status}]
+show(repo_path, sha) -> {author, message, timestamp, parents}
+current_sha(repo_path) -> sha
+log(repo_path, path?, limit?) -> [commits]
+blame(repo_path, path, line) -> commit
+```
+
+Implementation: shell out to `git` for v1. It's well-debugged, performant, and handles every edge case. Reach for libgit2 bindings only if you have a concrete reason — needing to run without `git` on PATH, or genuine process-spawn overhead at high QPS.
+
+### 3.4 v1 implementations
+
+- **`GitHubConnector.WebhookNotifier`** — receives `push` webhooks at an HTTP endpoint, validates HMAC signature, emits change events.
+- **`GitHubConnector.RepoCredentials`** — mints short-lived installation tokens via the GitHub App API; calls `GET /repos/{owner}/{repo}/branches/{branch}` for reconciliation.
+- **`GitHubConnector.RepoWriter`** — pushes a branch via authenticated git, opens a PR via Octokit.
+- **`GitService`** — shells out to `git`. Same implementation regardless of connector.
+
+**Auth model.** GitHub App. Customer installs the app on selected repos; we receive an installation ID and mint short-lived installation tokens per operation. Tokens are held in memory only, never written to disk. No long-lived PATs.
+
+### 3.5 What this means for future local-agent support
+
+The slimmer interface is *better* for the local-agent case, not worse. A local-agent connector implements:
+
+- `ChangeNotifier` watching `.git/refs/heads/{branch}` instead of webhooks.
+- `RepoCredentials.get_clone_url` as a no-op (sync layer skips the clone step entirely when the working copy is the user's actual repo). `get_branch_head` is a local `git rev-parse`.
+- `RepoWriter.open_pull_request` via local branch + `gh pr create`, or just a local commit the user reviews.
+
+The Git service is unchanged — it operates on whatever working copy it's pointed at. The tool layer is unchanged. The agent is unchanged. This is what we wanted: the variable parts (auth, notifications, PR creation) are isolated; everything else is platform-agnostic.
 
 ---
 
-## 4. Sync Orchestrator
+## 4. Sync Layer
 
-Stateless service that consumes change events from the connection layer and drives the rest of the pipeline.
+Bridges "GitHub said something happened" and "the agent has files it can grep." Doesn't know anything about docs, LLMs, or generation — its job ends when the working copy is current and a diff is computed.
 
 ### 4.1 Responsibilities
 
-- Look up `repos.last_synced_sha` for the repo.
-- Ensure the working-copy cache is at `to_sha` (clone if missing, otherwise `git fetch` + reset).
-- Compute the diff `last_synced_sha → to_sha`.
-- Enqueue a `GenerationJob` with the diff and repo ID.
-- On job completion, advance `last_synced_sha`.
+- Receive change events from the connection layer (webhooks, plus reconciliation cron as a safety net).
+- Verify webhook signatures and check idempotency on `(repo_id, after_sha)`.
+- Ensure the working-copy cache is at `after_sha` (clone if missing, otherwise `git fetch` + reset).
+- Compute the diff `before_sha → after_sha`.
+- Update `repos.last_synced_sha` and hand off to Planning.
 
-### 4.2 Working-copy cache
+### 4.2 Fast path vs worker
 
-- Located on attached disk per worker pool (e.g., `/var/lib/repos/{repo_id}`).
-- Shallow clones by default; deepened on demand when `git log` is needed for context.
-- LRU eviction when disk pressure exceeds threshold; re-clone is cheap.
-- One repo, one working copy per worker — no concurrent writes to the same checkout. Use a per-repo lock during sync.
+The webhook handler should be fast — GitHub retries on slow responses. The handler does cheap validation (signature, idempotency lookup) and enqueues a `SyncJob`. A worker picks the job up and does the actual git operations: it gets a clone URL from `RepoCredentials`, then uses the `Git` service to clone or fetch+reset. This separation lets sync workers (I/O-bound, small) scale independently from generation workers (LLM-bound, larger). Use two queues, not one.
 
-### 4.3 Tenant isolation
+### 4.3 Working-copy cache
 
-- Working copies for different customers live in separate directories with separate filesystem permissions.
-- All repo operations are read-only at the OS level (grep, read, AST parse, `git log`). No `npm install`, no running customer scripts in v1. This keeps the security model simple — we're processing files, not executing code.
-- Future "execute tests to enrich docs" features require sandboxed runners (Firecracker / gVisor / ephemeral containers) and are explicitly out of scope for v1.
+The working copy is a *cache*, not storage — fully reconstructable from GitHub. Don't back it up, don't replicate it, evict it freely under disk pressure.
+
+- Located on attached disk per worker pool, namespaced per tenant: `/var/lib/repo-cache/{tenant_id}/{repo_id}/`.
+- Shallow clones by default (depth ~50); `git fetch --deepen=N` on demand if more history is needed.
+- LRU eviction tracked via `repos.last_accessed_at` in Postgres; re-clone is cheap.
+- Per-tenant disk quotas to prevent one customer from starving others.
+- Per-repo locks during sync (Postgres advisory lock or Redis) so concurrent webhooks for the same repo don't race on the same working copy. Lock at the repo level, not the tenant level.
+
+### 4.4 Tenant isolation
+
+Three layers, each doing real work:
+
+- **Filesystem.** Working copies are namespaced under `{tenant_id}/{repo_id}/`. Every downstream tool call takes a `repo_id`, resolves it to its canonical path, and refuses to operate on paths that don't resolve under that prefix. Path traversal is rejected at this layer.
+- **Process.** A sync worker handles one job at a time. For higher-isolation deployments (enterprise), run each job in an ephemeral container that's torn down after — guarantees that one tenant's process state can never see another's.
+- **Credentials.** GitHub installation tokens are minted per-operation, scoped to the minimum repo set, short-lived, and held in memory only. A token issued for tenant A's repo cannot read tenant B's — GitHub enforces this server-side.
+
+All repo operations are read-only at the OS level (grep, read, AST parse, `git log`). No `npm install`, no running customer scripts in v1. Crossing this line requires real sandboxing (Firecracker / gVisor / ephemeral containers) and is explicitly out of scope.
+
+### 4.5 Reconciliation
+
+Webhooks fail. Networks blip. Workers crash mid-sync. A periodic job (every ~15 minutes per active repo) checks the actual default-branch HEAD via the GitHub API against `repos.last_synced_sha`; on drift, enqueues a SyncJob to catch up. Webhooks are the fast path; reconciliation is the correctness guarantee.
+
+### 4.6 Idempotency
+
+The single highest-leverage property in this layer. Idempotency on `(repo_id, after_sha)` makes most failure modes benign: duplicate webhook → no-op; worker crashed mid-sync → restart with no harm; reconciliation finds the same SHA we already processed → return early. Track every webhook delivery in `webhook_deliveries` for both idempotency and debugging.
 
 ---
 
-## 5. Comprehension Engine
+## 5. Planning
 
-Builds and maintains structural understanding of each repo. **No LLMs in this stage** — it's deterministic, fast, and cached.
+Thin layer between sync and the agent runtime. Two responsibilities, both small enough that this isn't really an "engine" — it's a service that maintains two pieces of Postgres state and answers one query.
 
-### 5.1 Pipeline
+### 5.1 Responsibilities
 
-1. **Project profile.** Detect language(s), framework(s), package manager(s) from manifest files. Cached and refreshed on manifest changes.
-2. **Symbol extraction.** Tree-sitter parses every source file and emits a structured inventory: functions, classes, exports, types, public API surface.
-3. **Dependency graph.** Static analysis of imports/requires builds a directed graph: `file → files it depends on`.
-4. **Entry-point detection.** `main.py`, `index.ts`, route definitions, CLI commands, top-level exports.
-5. **Doc plan.** Given the above, propose the target doc tree (READMEs per module, architecture overview, reference docs for public APIs, etc.). The plan is stored in Postgres and evolves with the repo.
-6. **Source-to-doc index.** For each planned doc, record which source files it depends on. This is what makes targeted regeneration possible.
+**Maintain the doc plan.** The doc plan is the target tree of docs that should exist for a repo (READMEs per significant module, architecture overview, reference docs for public APIs, etc.). When the diff changes module structure — new directories, removed packages — update the plan. This involves judgment, so it's a small-LLM call, not pure mechanics. Most pushes don't change the plan at all.
 
-### 5.2 Incremental updates
+**Maintain the source-to-doc map.** For each planned doc, record which source files it depends on. This is mechanical: imports, the file paths the doc was generated from, anything inside the doc's "scope" per the plan. Stored in Postgres keyed by source path so the reverse lookup ("which docs depend on this file?") is a fast index hit.
 
-On every push, the engine updates only what changed:
-- Re-parse changed files (tree-sitter).
-- Update edges in the dep graph touching changed files.
-- Update the doc plan if module structure changed (new directories, removed packages).
+**Resolve the diff to affected docs.** Given a list of changed source files, look up the docs that depend on them. Produces a candidate set for the triage classifier. This is a single Postgres query.
 
-The full pipeline only runs once, on initial onboarding. Steady-state runs are fast.
+### 5.2 What's *not* here
+
+Earlier drafts had this layer doing symbol extraction and dep-graph construction over the entire repo on every push. That's been pushed down into the agent's tool layer as on-demand discovery — tree-sitter and ripgrep are fast enough that running them at query time is fine, and skipping the precompute eliminates a category of staleness bugs.
+
+If profiling later shows the agent's on-demand discovery is too slow, the right place to add caching is behind the tool interface — not by reviving a precomputed comprehension layer. The agent shouldn't know whether `find_symbol` hits a cache or runs fresh.
+
+### 5.3 Initial onboarding
+
+The doc plan has to start from somewhere. On first install for a repo, the planner does a one-time pass: profiles the repo (language, framework, structure), proposes an initial plan against a default template, and seeds the source-to-doc map. After that, all updates are incremental.
 
 ---
 
@@ -176,15 +244,15 @@ The core engine that does the actual reading, writing, and reasoning. Used by bo
 
 ### 6.1 Tool layer
 
-Tools are an interface. v1 implements them against the server-side working copy; future local-agent implementations swap the backend without changing agent logic.
+Tools are an interface. v1 implements them against the server-side working copy; future local-agent implementations swap the backend without changing agent logic. Discovery is **on-demand** — `find_symbol` runs tree-sitter against the relevant files at query time rather than hitting a precomputed index. If profiling later shows this is too slow, caching goes behind this interface, invisible to the agent.
 
 | Tool | Purpose | Backed by |
 |---|---|---|
 | `read_file(path, range?)` | Direct file reads | filesystem |
 | `list_directory(path)` | Navigation | filesystem |
 | `grep(pattern, path?, opts?)` | Literal/regex search | ripgrep |
-| `find_symbol(name)` | Definition lookup | tree-sitter index |
-| `find_references(symbol)` | Usage lookup | tree-sitter index |
+| `find_symbol(name)` | Definition lookup | tree-sitter, on-demand |
+| `find_references(symbol)` | Usage lookup | tree-sitter + ripgrep, on-demand |
 | `git_log(path, limit?)` | History for "why" context | `git log` |
 | `git_blame(path, line)` | Line-level provenance | `git blame` |
 | `semantic_search(query)` | Fuzzy navigation when symbol unknown | pgvector over file summaries |
@@ -192,17 +260,11 @@ Tools are an interface. v1 implements them against the server-side working copy;
 
 **Retrieval philosophy.** Grep and AST search are primary. Semantic search is a navigational aid for when the agent doesn't yet know what to look for — it returns candidate paths the agent then reads directly. Embeddings find the haystack; grep finds the needle.
 
-### 6.2 The three agent modes
+### 6.2 The two agent modes
 
-All three are the same loop (gather context → produce output → validate → iterate) with different prompts and exit conditions.
+The runtime serves two consumers, both running the same loop (gather context → produce output → validate → iterate) with different prompts and exit conditions.
 
-#### Triage classifier (cheap model, e.g., Haiku)
-
-Input: a diff and a candidate doc.
-Output: `regenerate | targeted_edit | no_op` plus rationale.
-Purpose: avoid expensive regeneration when a code change doesn't actually affect what a doc says (internal refactors, formatting, etc.).
-
-#### Generator (capable model, e.g., Opus)
+#### Generator (capable model)
 
 Input: doc spec, prior version (if any), source dependency files, related docs, repo conventions, doc-type template.
 Loop: agent decides what additional context it needs, calls tools, writes a draft, self-checks against requirements, emits final doc with embedded source citations.
@@ -212,6 +274,10 @@ Output: Markdown with `<!-- src: path:line-range -->` anchors for traceability.
 
 Input: user question, repo ID.
 Loop: same tool-use loop as the generator, but optimizing for an answer rather than a doc artifact. First-pass uses semantic_search over generated docs (fast, often sufficient); falls back to code-level tools when docs don't contain the answer.
+
+#### A note on triage
+
+The triage classifier (cheap model, returns `regenerate | targeted_edit | no_op` per candidate doc) is its own upstream stage — see Section 2's diagram. It runs between Planning and the Agent Runtime, gating the expensive generator. It uses a small subset of the tool layer (mostly `read_file` on the prior doc and the diff) but isn't part of the runtime proper.
 
 ### 6.3 Generation context, in detail
 
@@ -229,7 +295,7 @@ For each doc to generate, the orchestrator assembles:
 Runs after generation, before publishing. Failures are returned to the agent for self-correction; persistent failures flag for human review.
 
 - **Code example parsing.** TypeScript snippets pass `tsc --noEmit`; Python through `ast.parse`; etc. per language.
-- **Symbol resolution.** Every symbol referenced in the doc resolves in the symbol index. Catches hallucinated APIs, the #1 source of user trust loss in auto-doc tools.
+- **Symbol resolution.** Every symbol referenced in the doc resolves against a tree-sitter pass over the working copy. Catches hallucinated APIs, the #1 source of user trust loss in auto-doc tools.
 - **Internal link integrity.** All `./other-doc.md` and `#anchor` references resolve.
 - **Diff sanity.** If a one-line code change produced a 90% rewrite, flag for review rather than auto-publishing.
 - **Citation coverage.** Every non-trivial claim has a source anchor.
@@ -255,25 +321,28 @@ CREATE TABLE repos (
   default_branch TEXT,
   last_synced_sha TEXT,
   last_synced_at TIMESTAMPTZ,
+  last_accessed_at TIMESTAMPTZ,  -- LRU eviction signal
+  cache_pinned BOOLEAN DEFAULT false,
   status TEXT                 -- onboarding | active | paused | error
 );
 
--- Comprehension cache
-CREATE TABLE symbols (
+-- Sync layer state
+CREATE TABLE webhook_deliveries (
   id UUID PRIMARY KEY,
   repo_id UUID,
-  path TEXT, name TEXT, kind TEXT,
-  start_line INT, end_line INT,
-  signature TEXT,
-  exported BOOLEAN,
-  at_sha TEXT
+  delivery_id TEXT UNIQUE,    -- GitHub's X-GitHub-Delivery header
+  event_type TEXT,
+  before_sha TEXT, after_sha TEXT,
+  received_at TIMESTAMPTZ,
+  processed_at TIMESTAMPTZ
 );
-CREATE INDEX ON symbols (repo_id, name);
-CREATE INDEX ON symbols (repo_id, path);
+CREATE INDEX ON webhook_deliveries (repo_id, after_sha);  -- idempotency check
 
-CREATE TABLE file_dependencies (
-  repo_id UUID, from_path TEXT, to_path TEXT,
-  PRIMARY KEY (repo_id, from_path, to_path)
+CREATE TABLE sync_jobs (
+  id UUID PRIMARY KEY,
+  repo_id UUID, before_sha TEXT, after_sha TEXT,
+  status TEXT, error TEXT,
+  started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ
 );
 
 -- Doc plan and state
@@ -320,28 +389,44 @@ CREATE TABLE file_summaries (
 -- Operational
 CREATE TABLE generation_jobs (
   id UUID PRIMARY KEY,
-  repo_id UUID, from_sha TEXT, to_sha TEXT,
+  repo_id UUID, document_id UUID,
+  from_sha TEXT, to_sha TEXT,
   status TEXT, error TEXT,
   cost_usd NUMERIC,
   started_at TIMESTAMPTZ, finished_at TIMESTAMPTZ
 );
 CREATE TABLE pull_requests (
   id UUID PRIMARY KEY,
-  job_id UUID, repo_id UUID,
+  repo_id UUID,
   pr_number INT, pr_url TEXT,
   state TEXT, opened_at TIMESTAMPTZ, merged_at TIMESTAMPTZ
 );
+
+-- OPTIONAL OPTIMIZATIONS — only add when profiling demands it.
+-- v1 does symbol/dep discovery on-demand via tree-sitter and ripgrep.
+-- These tables become useful if on-demand discovery proves too slow.
+--
+-- CREATE TABLE symbols (
+--   id UUID PRIMARY KEY, repo_id UUID,
+--   path TEXT, name TEXT, kind TEXT,
+--   start_line INT, end_line INT, signature TEXT,
+--   exported BOOLEAN, at_sha TEXT
+-- );
+-- CREATE TABLE file_dependencies (
+--   repo_id UUID, from_path TEXT, to_path TEXT,
+--   PRIMARY KEY (repo_id, from_path, to_path)
+-- );
 ```
 
 ### 7.2 What lives where
 
 - **Repo (Markdown files committed via PR)** — the published, user-facing docs. Customer-owned, customer-readable, version-controlled by Git.
-- **Postgres** — everything *about* docs: plan, dep graph, generation metadata, embeddings, prior versions, analytics, feedback. Customer never sees this directly.
+- **Postgres** — the doc plan, source-to-doc map, generation metadata, embeddings, prior versions, analytics, feedback, sync state. Customer never sees this directly.
 - **Working-copy disk cache** — ephemeral mirror of the repo. Re-clonable at any time; not a system of record.
 
 ### 7.3 Sync direction and human edits
 
-- System-of-truth flow: source code (repo) → comprehension (Postgres) → generation → published docs (repo).
+- System-of-truth flow: source code (repo) → planning (Postgres) → generation → published docs (repo).
 - Sync is **one-way for v1**. Postgres → repo only.
 - **Human-edit detection.** Before regenerating, compare the current doc in the repo to the hash we recorded when we last wrote it. If it differs, treat the doc as human-edited and one of:
   - Skip regeneration entirely (default, safest).
@@ -397,12 +482,13 @@ Q&A is a thin wrapper over the existing Agent Runtime. The infrastructure invest
 
 ## 10. Future Extension: Local Agent
 
-The architecture is built so a local-agent connector slots in without core changes.
+The architecture is built so a local-agent connector slots in without core changes. Since most of the original "RepoSource" interface was actually Git operations on a working copy, the slimmer connector design makes this *easier*, not harder.
 
-- **Same `RepoSource` implementation** (`GitRepoSource`) — operates on a path on disk, doesn't care if that disk is a server or a developer's laptop.
-- **Different `ChangeNotifier`** — `FilesystemWatcher` watching `.git/refs/heads/{branch}`.
-- **Different `RepoWriter`** — writes to a local branch and lets the user push, or opens a PR via the user's gh CLI.
-- **Different `Tools` backend** — same interface, executes shell tools on the local machine instead of the server.
+- **Same `Git` service** — operates on a path on disk, doesn't care if that disk is a server or a developer's laptop. No changes needed.
+- **Same tool layer backend** — `read_file`, `grep`, `find_symbol`, etc. all work against the local working copy. No changes needed.
+- **Different `ChangeNotifier`** — `FilesystemWatcher` watching `.git/refs/heads/{branch}` instead of webhooks.
+- **Different `RepoCredentials`** — `get_clone_url` is a no-op; the sync layer skips clone/fetch entirely when the working copy *is* the user's repo. `get_branch_head` is a local `git rev-parse`.
+- **Different `RepoWriter`** — writes a local branch, then either lets the user push or shells out to `gh pr create`.
 - **LLM calls still go to your server.** Customer code never crosses the network; only the prompts and assembled context the agent decides to send do.
 
 This is the right architecture for security-conscious customers who can't accept a hosted clone of their repo, and it's additive — you ship it when you have demand for it.
@@ -441,15 +527,16 @@ This is the right architecture for security-conscious customers who can't accept
 
 ## 12. Build Order
 
-Roughly the sequence I'd actually ship in:
+Roughly the sequence to actually ship in:
 
-1. **Connection layer + sync orchestrator.** GitHub App, webhook receiver, working-copy cache, basic sync state. End state: we know when a repo changes and we have its files on disk.
-2. **Comprehension engine.** Tree-sitter symbol extraction, dep graph, file summaries with embeddings. End state: we have a structured map of every connected repo.
-3. **Tool layer.** All the read/grep/find_symbol/git tools, well-tested in isolation. This is the foundation for everything downstream.
+1. **Connection layer + Git service + sync layer.** GitHub App (auth, webhook receiver, RepoCredentials, RepoWriter), the Git service shell-out wrapper, working-copy cache, idempotency, reconciliation cron. End state: we know when a repo changes and we have its files on disk, with proper tenant isolation.
+2. **Tool layer.** All the read/grep/find_symbol/git tools, well-tested in isolation against the working copy. This is the foundation for everything downstream — both generation and Q&A use it.
+3. **Planning service.** Initial doc plan from a default template, source-to-doc map (mechanical, derived from imports + plan), diff-to-affected-docs query. Keep this small.
 4. **Generator agent — narrow scope first.** Only READMEs and a top-level architecture doc. End state: real docs being committed via PR for one or two design-partner customers.
-5. **Triage classifier and validator.** Now that docs exist, optimize the regeneration loop and harden against hallucinated symbols / broken examples.
+5. **Triage classifier and validator.** Now that docs exist, optimize the regeneration loop (so most pushes don't trigger expensive generation) and harden against hallucinated symbols / broken examples.
 6. **Doc plan expansion.** Add reference docs for public APIs, then conceptual docs. Each doc type is its own quality investment.
 7. **Q&A endpoint.** Built on the existing tool layer + doc embeddings. This is where the modularity pays back.
 8. **Local-agent connector.** Once enough security-conscious customers ask for it.
+9. **Optional optimizations.** Symbol/dep-graph caching behind the tool interface, only if profiling proves the agent's on-demand discovery is the bottleneck.
 
-The single highest-leverage thing to nail in the first three steps is the **dependency graph + targeted regeneration**. That's what makes the system feel like it actually understands the codebase rather than blindly rewriting docs whenever code changes — and it's what justifies the whole agentic framing in the first place.
+The single highest-leverage thing to nail in the first four steps is the **source-to-doc map + targeted regeneration**. That's what makes the system feel like it actually understands the codebase rather than blindly rewriting docs whenever code changes — and it's what justifies the whole agentic framing in the first place.
