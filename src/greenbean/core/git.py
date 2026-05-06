@@ -1,4 +1,6 @@
-"""Git service — thin async wrapper around the ``git`` CLI.
+"""Git service — thin async wrapper over the ``git`` CLI.
+
+This is shared everywhere and not connector specific.
 
 Operates on a working copy on disk. Used by sync, planning, and the agent's
 tool layer. Not part of the connection abstraction; it is the same on every
@@ -14,6 +16,9 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 # URLs containing embedded credentials (``https://x-access-token:TOKEN@host/...``)
@@ -24,6 +29,33 @@ _CREDENTIAL_URL_RE = re.compile(r"https://[^@\s/]+:[^@\s/]+@")
 
 def _redact(text: str) -> str:
     return _CREDENTIAL_URL_RE.sub("https://<redacted>@", text)
+
+
+@dataclass(frozen=True, slots=True)
+class Commit:
+    sha: str
+    parents: tuple[str, ...]
+    author: str
+    timestamp: datetime
+    message: str  # full commit message (subject + body)
+
+
+@dataclass(frozen=True, slots=True)
+class BlameLine:
+    sha: str
+    author: str
+    timestamp: datetime
+    text: str  # the source line itself
+
+
+# Field separator inside one commit and record separator between commits in
+# our ``git log`` output. Null + ASCII Record-Separator are safe choices:
+# neither can legally appear in commit metadata. We pass the *escapes*
+# (``%x00``, ``%x1e``) as text in argv — POSIX argv can't contain literal
+# null bytes — and git interprets them and emits the real byte in its stdout.
+_LOG_FIELD_SEP = "\x00"
+_LOG_RECORD_SEP = "\x1e"
+_LOG_FORMAT = "%H%x00%P%x00%an%x00%aI%x00%B%x1e"
 
 
 class GitError(RuntimeError):
@@ -80,6 +112,36 @@ class GitService:
         out = await self._run("-C", str(repo_path), "rev-parse", "HEAD")
         return out.strip()
 
+    async def log(
+        self,
+        repo_path: Path,
+        *,
+        path: str | None = None,
+        limit: int | None = None,
+    ) -> Sequence[Commit]:
+        """Return commits touching ``path`` (or whole repo), newest first."""
+        args: list[str] = ["-C", str(repo_path), "log", f"--format={_LOG_FORMAT}"]
+        if limit is not None:
+            args += [f"-{limit}"]
+        if path is not None:
+            args += ["--", path]
+        out = await self._run(*args)
+        return tuple(_parse_log(out))
+
+    async def blame(self, repo_path: Path, path: str, line: int) -> BlameLine:
+        """Return the commit and author that last touched ``path``:``line``."""
+        out = await self._run(
+            "-C",
+            str(repo_path),
+            "blame",
+            "--line-porcelain",
+            "-L",
+            f"{line},{line}",
+            "--",
+            path,
+        )
+        return _parse_blame_porcelain(out)
+
     async def ls_remote(self, url: str, ref: str) -> str:
         """Look up the SHA that ``ref`` resolves to on the remote at ``url``.
 
@@ -106,3 +168,50 @@ class GitService:
         if rc != 0:
             raise GitError(args, rc, stderr_b.decode("utf-8", errors="replace"))
         return stdout_b.decode("utf-8")
+
+
+def _parse_log(text: str) -> list[Commit]:
+    commits: list[Commit] = []
+    for record in text.split(_LOG_RECORD_SEP):
+        record = record.strip("\n")
+        if not record:
+            continue
+        sha, parents_raw, author, ts_raw, message = record.split(_LOG_FIELD_SEP, 4)
+        parents = tuple(p for p in parents_raw.split(" ") if p)
+        commits.append(
+            Commit(
+                sha=sha,
+                parents=parents,
+                author=author,
+                timestamp=datetime.fromisoformat(ts_raw),
+                message=message.rstrip("\n"),
+            )
+        )
+    return commits
+
+
+def _parse_blame_porcelain(text: str) -> BlameLine:
+    """Parse a single ``--line-porcelain`` block into a ``BlameLine``."""
+    lines = text.splitlines()
+    if not lines:
+        raise ValueError("empty blame output")
+    sha = lines[0].split(" ", 1)[0]
+    author = ""
+    author_time: int | None = None
+    line_text = ""
+    for raw in lines[1:]:
+        if raw.startswith("author "):
+            author = raw[len("author ") :]
+        elif raw.startswith("author-time "):
+            author_time = int(raw[len("author-time ") :])
+        elif raw.startswith("\t"):
+            line_text = raw[1:]
+            break
+    if author_time is None:
+        raise ValueError("blame output missing author-time field")
+    return BlameLine(
+        sha=sha,
+        author=author,
+        timestamp=datetime.fromtimestamp(author_time, tz=UTC),
+        text=line_text,
+    )
