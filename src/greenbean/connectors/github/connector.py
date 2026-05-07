@@ -1,4 +1,12 @@
-"""``GitHubConnector`` — bundles the three GitHub interface implementations."""
+"""
+``GitHubConnector`` — bundles the three GitHub interface implementations.
+
+Composition point that wires up the 3 required connector components for GitHub
+
+Lifecycle note: callers should invoke ``aclose`` when done so any owned
+network resources (for example an internally created ``httpx.AsyncClient``)
+are closed deterministically.
+"""
 
 from __future__ import annotations
 

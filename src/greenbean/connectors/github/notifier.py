@@ -5,6 +5,9 @@ signature, parses the payload, and feeds verified ``ChangeEvent`` instances
 into ``dispatch``. From there each registered subscriber callback runs in
 turn — deduplication on ``(repo.id, after_sha)`` is the orchestrator's job,
 not the notifier's.
+
+Implementation status: scaffold only in v1. Methods currently raise
+``NotImplementedError`` until webhook plumbing is wired in.
 """
 
 from __future__ import annotations

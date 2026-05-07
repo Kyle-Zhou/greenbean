@@ -1,6 +1,9 @@
 """GitHub ``RepoWriter`` — opens pull requests via the GitHub App.
 
 Uses short-lived installation tokens minted per operation; no long-lived PATs.
+
+Implementation status: scaffold only in v1. ``open_pull_request`` currently
+raises ``NotImplementedError`` until publish-path wiring is built.
 """
 
 from __future__ import annotations

@@ -1,5 +1,7 @@
 """Connection-layer interfaces.
 
+Platform abstraction boundary -> to be implemented for each platform (GitHub, Local Agent, etc.)
+
 The connector exposes only what's *genuinely platform-specific* — the things a
 hosting platform does that ``git`` alone can't. Everything else (reading
 files, diffing, listing trees, inspecting commits) is a ``git`` operation on

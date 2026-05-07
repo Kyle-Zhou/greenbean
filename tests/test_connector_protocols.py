@@ -13,6 +13,7 @@ These tests guard two invariants:
 from __future__ import annotations
 
 import importlib
+import inspect
 import pkgutil
 
 from greenbean.connectors.github import (
@@ -51,6 +52,22 @@ def _assignable(value: object, protocol: type) -> bool:
     return True
 
 
+def _assert_method_signature_matches_protocol(
+    value: object,
+    protocol: type,
+    method_name: str,
+) -> None:
+    """Guard against protocol-conforming names with drifting call signatures."""
+    protocol_method = getattr(protocol, method_name)
+    impl_method = getattr(type(value), method_name)
+    expected = inspect.signature(protocol_method)
+    actual = inspect.signature(impl_method)
+    assert actual == expected, (
+        f"{type(value).__name__}.{method_name} signature drifted from "
+        f"{protocol.__name__}.{method_name}: expected {expected}, got {actual}"
+    )
+
+
 def test_github_credentials_satisfies_repo_credentials() -> None:
     instance = GitHubCredentials(
         app_id="1",
@@ -58,16 +75,27 @@ def test_github_credentials_satisfies_repo_credentials() -> None:
         repo_resolver=_stub_resolver,
     )
     assert _assignable(instance, RepoCredentials)
+    _assert_method_signature_matches_protocol(
+        instance, RepoCredentials, "get_clone_url"
+    )
+    _assert_method_signature_matches_protocol(
+        instance, RepoCredentials, "get_branch_head"
+    )
 
 
 def test_webhook_notifier_satisfies_change_notifier() -> None:
     instance = WebhookNotifier(webhook_secret="secret")
     assert _assignable(instance, ChangeNotifier)
+    _assert_method_signature_matches_protocol(instance, ChangeNotifier, "subscribe")
+    _assert_method_signature_matches_protocol(instance, ChangeNotifier, "unsubscribe")
 
 
 def test_github_writer_satisfies_repo_writer() -> None:
     instance = GitHubWriter(app_id="1", private_key=b"")
     assert _assignable(instance, RepoWriter)
+    _assert_method_signature_matches_protocol(
+        instance, RepoWriter, "open_pull_request"
+    )
 
 
 def test_github_writer_advertises_pull_request_capability() -> None:
