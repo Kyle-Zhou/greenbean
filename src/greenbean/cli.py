@@ -32,6 +32,7 @@ from greenbean.core.connectors import RepoRef
 from greenbean.core.git import GitError, GitService
 from greenbean.core.planning import PlannedDoc
 from greenbean.planning import DefaultPlanner, SqliteDocStore
+from greenbean.settings import Settings
 from greenbean.tools.working_copy import WorkingCopyTools
 
 DEFAULT_CACHE_ROOT = Path.home() / ".greenbean" / "cache"
@@ -109,7 +110,7 @@ def _build_parser() -> argparse.ArgumentParser:
     gen.add_argument(
         "--model",
         default=None,
-        help="Claude model to use (default: claude-opus-4-7).",
+        help="Anthropic model override (default: $GREENBEAN_GENERATOR_MODEL or claude-sonnet-4-6).",
     )
 
     return parser
@@ -220,12 +221,10 @@ async def _generate(args: argparse.Namespace) -> int:
         print("hint: run `greenbean plan init` first", file=sys.stderr)
         return 1
 
-    kwargs: dict[str, object] = {}
-    if args.model:
-        kwargs["model"] = args.model
-
+    settings = Settings.from_env()
+    model = args.model or settings.generator_model
     tools = WorkingCopyTools(repo_path)
-    generator = Generator(tools, **kwargs)  # type: ignore[arg-type]
+    generator = Generator(tools, model=model, client=settings.make_generator_client())
 
     with SqliteDocStore(state_path) as store:
         docs = store.list_documents()
@@ -260,7 +259,7 @@ async def _generate(args: argparse.Namespace) -> int:
                     doc.path_in_repo,
                     content_hash=content_hash,
                     metadata={
-                        "model": args.model or "claude-opus-4-7",
+                        "model": model,
                         "input_tokens": result.input_tokens,
                         "output_tokens": result.output_tokens,
                         "tool_calls": result.tool_calls,

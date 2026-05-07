@@ -1,13 +1,12 @@
 """Tests for the Generator agentic loop.
 
-All tests use a fake client; no real Claude API calls are made.
+All tests use a fake LLMClient; no real Claude API calls are made.
 """
 
 from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -19,6 +18,16 @@ from greenbean.agent.generator import (
     _build_initial_message,
     _extract_text,
     _load_prompt,
+)
+from greenbean.core.llm import (
+    AssistantMessage,
+    LLMResponse,
+    TextBlock,
+    ToolDefinition,
+    ToolResult,
+    ToolUseBlock,
+    Usage,
+    UserMessage,
 )
 from greenbean.core.planning import Document
 from greenbean.core.tools import DirEntry, GrepHit
@@ -44,14 +53,14 @@ def _make_doc(
     )
 
 
-def _text_block(text: str) -> SimpleNamespace:
-    return SimpleNamespace(type="text", text=text)
+def _text_block(text: str) -> TextBlock:
+    return TextBlock(text=text)
 
 
 def _tool_use_block(
     name: str, tool_input: dict[str, Any], tool_id: str = "tu_1"
-) -> SimpleNamespace:
-    return SimpleNamespace(type="tool_use", id=tool_id, name=name, input=tool_input)
+) -> ToolUseBlock:
+    return ToolUseBlock(id=tool_id, name=name, input=tool_input)
 
 
 def _make_response(
@@ -59,17 +68,21 @@ def _make_response(
     stop_reason: str,
     input_tokens: int = 10,
     output_tokens: int = 20,
-) -> SimpleNamespace:
-    return SimpleNamespace(
+) -> LLMResponse:
+    return LLMResponse(
         content=content,
         stop_reason=stop_reason,
-        usage=SimpleNamespace(input_tokens=input_tokens, output_tokens=output_tokens),
+        usage=Usage(input_tokens=input_tokens, output_tokens=output_tokens),
     )
 
 
-def _make_client(*responses: Any) -> Any:
-    mock_create = AsyncMock(side_effect=list(responses))
-    return SimpleNamespace(messages=SimpleNamespace(create=mock_create))
+def _make_client(*responses: LLMResponse) -> Any:
+    mock_complete = AsyncMock(side_effect=list(responses))
+
+    class _FakeClient:
+        send_messages = mock_complete
+
+    return _FakeClient()
 
 
 class _StubTools:
@@ -169,7 +182,7 @@ def test_generate_end_turn_no_tools() -> None:
     client = _make_client(
         _make_response([_text_block("# README\nHello world")], stop_reason="end_turn")
     )
-    gen = Generator(_StubTools(), client=client)
+    gen = Generator(_StubTools(), model="test", client=client)
     result = asyncio.run(gen.generate(_make_doc(), source_paths=[]))
     assert result.content == "# README\nHello world"
     assert result.tool_calls == 0
@@ -195,7 +208,7 @@ def test_generate_one_tool_call_then_end_turn() -> None:
             output_tokens=50,
         ),
     )
-    gen = Generator(_StubTools(), client=client)
+    gen = Generator(_StubTools(), model="test", client=client)
     result = asyncio.run(gen.generate(_make_doc(), source_paths=["README.md"]))
     assert result.content == "# Generated README"
     assert result.tool_calls == 1
@@ -217,7 +230,7 @@ def test_generate_multiple_tools_in_one_turn() -> None:
         ),
         _make_response([_text_block("done")], stop_reason="end_turn"),
     )
-    gen = Generator(_StubTools(), client=client)
+    gen = Generator(_StubTools(), model="test", client=client)
     result = asyncio.run(gen.generate(_make_doc(), source_paths=[]))
     assert result.tool_calls == 2
     assert result.content == "done"
@@ -228,7 +241,7 @@ def test_generate_multiple_tools_in_one_turn() -> None:
 
 def test_generate_empty_content_returns_empty_string() -> None:
     client = _make_client(_make_response([], stop_reason="end_turn"))
-    gen = Generator(_StubTools(), client=client)
+    gen = Generator(_StubTools(), model="test", client=client)
     result = asyncio.run(gen.generate(_make_doc(), source_paths=[]))
     assert result.content == ""
 
@@ -241,7 +254,7 @@ def test_generate_stop_reason_tool_use_but_no_tool_blocks_terminates() -> None:
     client = _make_client(
         _make_response([_text_block("partial")], stop_reason="tool_use")
     )
-    gen = Generator(_StubTools(), client=client)
+    gen = Generator(_StubTools(), model="test", client=client)
     result = asyncio.run(gen.generate(_make_doc(), source_paths=[]))
     assert result.content == "partial"
     assert result.tool_calls == 0
@@ -253,13 +266,18 @@ def test_generate_stop_reason_tool_use_but_no_tool_blocks_terminates() -> None:
 def test_generate_source_paths_appear_in_first_message() -> None:
     captured: list[str] = []
 
-    async def _fake_create(**kwargs: Any) -> Any:
+    async def _fake_send_messages(self: Any, **kwargs: Any) -> LLMResponse:
         msgs = kwargs["messages"]
-        captured.append(msgs[0]["content"])
+        first = msgs[0]
+        assert isinstance(first, UserMessage)
+        assert isinstance(first.content, str)
+        captured.append(first.content)
         return _make_response([_text_block("ok")], stop_reason="end_turn")
 
-    client: Any = SimpleNamespace(messages=SimpleNamespace(create=_fake_create))
-    gen = Generator(_StubTools(), client=client)
+    class _FakeClient:
+        send_messages = _fake_send_messages
+
+    gen = Generator(_StubTools(), model="test", client=_FakeClient())
     asyncio.run(gen.generate(_make_doc(), source_paths=["src/foo.py", "src/bar.py"]))
     assert "src/foo.py" in captured[0]
     assert "src/bar.py" in captured[0]

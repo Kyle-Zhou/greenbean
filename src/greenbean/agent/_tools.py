@@ -9,12 +9,11 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from anthropic.types import ToolParam
-
+from greenbean.core.llm import ToolDefinition
 from greenbean.core.tools import Tools
 
-TOOL_SCHEMAS: list[ToolParam] = [
-    ToolParam(
+TOOL_SCHEMAS: list[ToolDefinition] = [
+    ToolDefinition(
         name="read_file",
         description="Read the contents of a file in the repository.",
         input_schema={
@@ -36,7 +35,7 @@ TOOL_SCHEMAS: list[ToolParam] = [
             "required": ["path"],
         },
     ),
-    ToolParam(
+    ToolDefinition(
         name="list_directory",
         description="List the entries in a directory.",
         input_schema={
@@ -49,7 +48,7 @@ TOOL_SCHEMAS: list[ToolParam] = [
             },
         },
     ),
-    ToolParam(
+    ToolDefinition(
         name="grep",
         description="Search for a pattern in the repository using ripgrep.",
         input_schema={
@@ -75,7 +74,7 @@ TOOL_SCHEMAS: list[ToolParam] = [
             "required": ["pattern"],
         },
     ),
-    ToolParam(
+    ToolDefinition(
         name="git_log",
         description="Show recent git commits, optionally filtered to a path.",
         input_schema={
