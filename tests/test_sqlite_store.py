@@ -213,6 +213,26 @@ def test_affected_docs_empty_paths_returns_empty() -> None:
         assert store.affected_docs([]) == ()
 
 
+# ----- source_paths_for ------------------------------------------------------
+
+
+def test_source_paths_for_returns_sources() -> None:
+    with _store() as store:
+        store.replace_plan([_make_planned("README.md", sources=["src/a.py", "src/b.py"])], SHA_A)
+        doc = store.get_document("README.md")
+        assert doc is not None
+        paths = store.source_paths_for(doc.id)
+        assert sorted(paths) == ["src/a.py", "src/b.py"]
+
+
+def test_source_paths_for_no_sources_returns_empty() -> None:
+    with _store() as store:
+        store.replace_plan([_make_planned("README.md", sources=[])], SHA_A)
+        doc = store.get_document("README.md")
+        assert doc is not None
+        assert store.source_paths_for(doc.id) == ()
+
+
 # ----- context manager -------------------------------------------------------
 
 

@@ -3,8 +3,9 @@
 Shared by DefaultPlanner and SqliteDocStore. No protocols here — a second
 backend doesn't exist yet; extract the interface when it does.
 
-holds the shared value types (DocSpec, Document, etc.) used by both sqlite_store.py and default_planner.py — that separation is load-bearing   
-since both modules import from it and neither should import from the other
+Holds the shared value types (DocSpec, Document, etc.) used by both sqlite_store.py
+and planner.py — that separation is load-bearing since both modules import from it
+and neither should import from the other.
 """
 
 from __future__ import annotations

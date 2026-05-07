@@ -171,6 +171,13 @@ class SqliteDocStore:
         ).fetchone()
         return int(row[0])
 
+    def source_paths_for(self, doc_id: str) -> Sequence[str]:
+        rows = self._con.execute(
+            "SELECT source_path FROM document_sources WHERE document_id = ? ORDER BY source_path",
+            (doc_id,),
+        ).fetchall()
+        return tuple(r["source_path"] for r in rows)
+
     def affected_docs(self, changed_paths: Sequence[str]) -> Sequence[Document]:
         if not changed_paths:
             return ()

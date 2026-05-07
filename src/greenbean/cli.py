@@ -8,6 +8,8 @@ agent → publish) will plug in here as it's built.
                           [--dest DIR] [--depth N]
     greenbean plan init <repo-path> [--state PATH]
     greenbean plan list <repo-path> [--state PATH]
+    greenbean generate <repo-path> [--state PATH] [--doc DOC_PATH]
+                                   [--dry-run] [--model MODEL]
 
 The token comes from ``--token`` or ``$GITHUB_TOKEN``. If no token is
 supplied, the bare URL is used — fine for public repos, ``file://`` URLs
@@ -18,16 +20,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import os
 import sys
 from pathlib import Path
 
+from greenbean.agent import Generator
 from greenbean.connectors.github import url as github_url
 from greenbean.connectors.github.token_credentials import TokenCredentials
 from greenbean.core.connectors import RepoRef
 from greenbean.core.git import GitError, GitService
 from greenbean.core.planning import PlannedDoc
 from greenbean.planning import DefaultPlanner, SqliteDocStore
+from greenbean.tools.working_copy import WorkingCopyTools
 
 DEFAULT_CACHE_ROOT = Path.home() / ".greenbean" / "cache"
 _DEFAULT_STATE_NAME = ".greenbean/state.sqlite"
@@ -81,6 +86,30 @@ def _build_parser() -> argparse.ArgumentParser:
         "--state",
         default=None,
         help="SQLite state file (default: <repo-path>/.greenbean/state.sqlite).",
+    )
+
+    gen = sub.add_parser("generate", help="Generate documentation for planned docs.")
+    gen.add_argument("repo_path", help="Path to a git working copy.")
+    gen.add_argument(
+        "--state",
+        default=None,
+        help="SQLite state file (default: <repo-path>/.greenbean/state.sqlite).",
+    )
+    gen.add_argument(
+        "--doc",
+        default=None,
+        metavar="DOC_PATH",
+        help="Generate only this document (e.g. README.md). Default: all docs.",
+    )
+    gen.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print generated content to stdout instead of writing files.",
+    )
+    gen.add_argument(
+        "--model",
+        default=None,
+        help="Claude model to use (default: claude-opus-4-7).",
     )
 
     return parser
@@ -182,6 +211,65 @@ def _plan_list(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _generate(args: argparse.Namespace) -> int:
+    repo_path = Path(args.repo_path).expanduser().resolve()
+    state_path = Path(args.state) if args.state else repo_path / _DEFAULT_STATE_NAME
+
+    if not state_path.exists():
+        print(f"error: state file not found: {state_path}", file=sys.stderr)
+        print("hint: run `greenbean plan init` first", file=sys.stderr)
+        return 1
+
+    kwargs: dict[str, object] = {}
+    if args.model:
+        kwargs["model"] = args.model
+
+    tools = WorkingCopyTools(repo_path)
+    generator = Generator(tools, **kwargs)  # type: ignore[arg-type]
+
+    with SqliteDocStore(state_path) as store:
+        docs = store.list_documents()
+        if args.doc:
+            docs = [d for d in docs if d.path_in_repo == args.doc]
+            if not docs:
+                print(f"error: no planned doc with path {args.doc!r}", file=sys.stderr)
+                return 1
+
+        if not docs:
+            print("no documents in plan", file=sys.stderr)
+            return 1
+
+        for doc in docs:
+            source_paths = store.source_paths_for(doc.id)
+            print(f"generating {doc.path_in_repo} ...", end=" ", flush=True)
+            result = await generator.generate(doc, source_paths)
+            print(
+                f"done ({result.tool_calls} tool calls, "
+                f"{result.input_tokens}+{result.output_tokens} tokens)"
+            )
+
+            if args.dry_run:
+                print(f"\n--- {doc.path_in_repo} ---")
+                print(result.content)
+            else:
+                out_path = repo_path / doc.path_in_repo
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(result.content, encoding="utf-8")
+                content_hash = hashlib.sha256(result.content.encode()).hexdigest()
+                store.record_generation(
+                    doc.path_in_repo,
+                    content_hash=content_hash,
+                    metadata={
+                        "model": args.model or "claude-opus-4-7",
+                        "input_tokens": result.input_tokens,
+                        "output_tokens": result.output_tokens,
+                        "tool_calls": result.tool_calls,
+                    },
+                )
+
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "clone":
@@ -191,6 +279,8 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_plan_init(args))
         if args.plan_command == "list":
             return _plan_list(args)
+    if args.command == "generate":
+        return asyncio.run(_generate(args))
     return 1
 
 
