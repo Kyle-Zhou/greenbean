@@ -162,7 +162,7 @@ async def _clone(args: argparse.Namespace) -> int:
 
 async def _plan_init(args: argparse.Namespace) -> int:
     repo_path = Path(args.repo_path).expanduser().resolve()
-    state_path = Path(args.state) if args.state else repo_path / _DEFAULT_STATE_NAME
+    state_path = Path(args.state).expanduser().resolve() if args.state else repo_path / _DEFAULT_STATE_NAME
 
     git = GitService()
     try:
@@ -191,7 +191,7 @@ async def _plan_init(args: argparse.Namespace) -> int:
 
 def _plan_list(args: argparse.Namespace) -> int:
     repo_path = Path(args.repo_path).expanduser().resolve()
-    state_path = Path(args.state) if args.state else repo_path / _DEFAULT_STATE_NAME
+    state_path = Path(args.state).expanduser().resolve() if args.state else repo_path / _DEFAULT_STATE_NAME
 
     if not state_path.exists():
         print(f"error: state file not found: {state_path}", file=sys.stderr)
@@ -214,7 +214,7 @@ def _plan_list(args: argparse.Namespace) -> int:
 
 async def _generate(args: argparse.Namespace) -> int:
     repo_path = Path(args.repo_path).expanduser().resolve()
-    state_path = Path(args.state) if args.state else repo_path / _DEFAULT_STATE_NAME
+    state_path = Path(args.state).expanduser().resolve() if args.state else repo_path / _DEFAULT_STATE_NAME
 
     if not state_path.exists():
         print(f"error: state file not found: {state_path}", file=sys.stderr)

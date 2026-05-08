@@ -128,6 +128,11 @@ class Generator:
                 break
 
             messages.append(UserMessage(content=tool_results))
+        else:
+            raise GeneratorError(
+                f"generation did not complete within {_MAX_TURNS} turns "
+                f"(stop_reason={response.stop_reason!r})"
+            )
 
         return GenerationResult(
             content=_extract_text(last_content),
