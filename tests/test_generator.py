@@ -260,6 +260,22 @@ def test_generate_stop_reason_tool_use_but_no_tool_blocks_terminates() -> None:
     assert result.tool_calls == 0
 
 
+# ----- Generator.generate: max turns exceeded raises GeneratorError ----------
+
+
+def test_generate_raises_on_max_turns_exceeded() -> None:
+    """A model that never emits end_turn should raise, not silently truncate."""
+    infinite_tool_response = _make_response(
+        [_tool_use_block("read_file", {"path": "README.md"})],
+        stop_reason="tool_use",
+    )
+    from greenbean.agent.generator import _MAX_TURNS
+    client = _make_client(*[infinite_tool_response] * _MAX_TURNS)
+    gen = Generator(_StubTools(), model="test", client=client)
+    with pytest.raises(GeneratorError, match="did not complete"):
+        asyncio.run(gen.generate(_make_doc(), source_paths=[]))
+
+
 # ----- Generator.generate: source paths forwarded to initial message ---------
 
 
