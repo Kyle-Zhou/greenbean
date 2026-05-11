@@ -1,8 +1,10 @@
 """greenbean CLI — single-tenant entry point.
 
-For now, just the clone smoke path so we can run greenbean against a real
-repo end to end. The rest of the pipeline (sync → planning → triage →
-agent → publish) will plug in here as it's built.
+The local-first flow: clone (or point at an existing working tree), plan,
+generate. Generated docs land in ``~/.greenbean/output/<host>/<owner>/<name>/``
+and never in the source repo — greenbean does not publish docs back to the
+customer's repo. ``run`` and ``watch`` (the full automation loop and its
+polling wrapper) plug in here next.
 
     greenbean clone <url> [--token TOKEN] [--branch BRANCH]
                           [--dest DIR] [--depth N]
@@ -36,7 +38,27 @@ from greenbean.settings import Settings
 from greenbean.tools.working_copy import WorkingCopyTools
 
 DEFAULT_CACHE_ROOT = Path.home() / ".greenbean" / "cache"
+DEFAULT_OUTPUT_ROOT = Path.home() / ".greenbean" / "output"
 _DEFAULT_STATE_NAME = ".greenbean/state.sqlite"
+
+
+async def _output_root_for(repo_path: Path, git: GitService) -> Path:
+    """Resolve where generated docs for ``repo_path`` should land.
+
+    Reads ``origin``'s URL and parses it as a GitHub repo. Falls back to a
+    ``_local/<basename>`` namespace when the working copy has no origin or
+    its URL isn't a recognizable GitHub URL — keeps local fixtures and
+    file:// clones working.
+    """
+    try:
+        remote = await git.remote_url(repo_path)
+    except GitError:
+        remote = ""
+    if remote:
+        parsed = github_url.try_parse(remote)
+        if parsed is not None:
+            return DEFAULT_OUTPUT_ROOT / "github.com" / parsed.owner / parsed.name
+    return DEFAULT_OUTPUT_ROOT / "_local" / repo_path.resolve().name
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -223,8 +245,11 @@ async def _generate(args: argparse.Namespace) -> int:
 
     settings = Settings.from_env()
     model = args.model or settings.generator_model
+    git = GitService()
     tools = WorkingCopyTools(repo_path)
     generator = Generator(tools, model=model, client=settings.make_generator_client())
+
+    output_root = await _output_root_for(repo_path, git)
 
     with SqliteDocStore(state_path) as store:
         docs = store.list_documents()
@@ -251,7 +276,7 @@ async def _generate(args: argparse.Namespace) -> int:
                 print(f"\n--- {doc.path_in_repo} ---")
                 print(result.content)
             else:
-                out_path = repo_path / doc.path_in_repo
+                out_path = output_root / doc.path_in_repo
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 out_path.write_text(result.content, encoding="utf-8")
                 content_hash = hashlib.sha256(result.content.encode()).hexdigest()
@@ -265,6 +290,7 @@ async def _generate(args: argparse.Namespace) -> int:
                         "tool_calls": result.tool_calls,
                     },
                 )
+                print(f"  wrote {out_path}")
 
     return 0
 

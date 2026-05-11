@@ -1,7 +1,9 @@
-"""
-``GitHubConnector`` — bundles the three GitHub interface implementations.
+"""``GitHubConnector`` — composition point for the deferred SaaS deployment.
 
-Composition point that wires up the 3 required connector components for GitHub
+Bundles the GitHub-App ``RepoCredentials`` and the webhook ``ChangeNotifier``.
+**Not** used by the v1 CLI — the CLI uses ``TokenCredentials`` directly and
+polls via ``greenbean watch``. This aggregate is kept so the GitHub App seam
+is documented and ready when SaaS work resumes (see Architecture.md §10).
 
 Lifecycle note: callers should invoke ``aclose`` when done so any owned
 network resources (for example an internally created ``httpx.AsyncClient``)
@@ -17,7 +19,6 @@ from greenbean.connectors.github.credentials import (
     GitHubRepoResolver,
 )
 from greenbean.connectors.github.notifier import WebhookNotifier
-from greenbean.connectors.github.writer import GitHubWriter
 
 
 class GitHubConnector:
@@ -39,7 +40,6 @@ class GitHubConnector:
             repo_resolver=repo_resolver,
             http=http,
         )
-        self._writer = GitHubWriter(app_id=app_id, private_key=private_key)
 
     async def aclose(self) -> None:
         await self._credentials.aclose()
@@ -51,7 +51,3 @@ class GitHubConnector:
     @property
     def credentials(self) -> GitHubCredentials:
         return self._credentials
-
-    @property
-    def writer(self) -> GitHubWriter:
-        return self._writer

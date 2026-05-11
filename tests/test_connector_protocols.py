@@ -2,9 +2,12 @@
 
 These tests guard two invariants:
 
-1. The v1 GitHub stubs structurally satisfy the core protocols. If someone
-   adds a new method to ``RepoCredentials`` and forgets to update the GitHub
-   implementation, this catches it before it reaches a runtime call site.
+1. The GitHub stubs (``GitHubCredentials``, ``WebhookNotifier``) structurally
+   satisfy the core protocols. If someone adds a new method to
+   ``RepoCredentials`` and forgets to update the GitHub implementation, this
+   catches it before it reaches a runtime call site. The stubs are
+   deprecated for v1 but kept for the future SaaS deployment, so the
+   conformance check stays.
 2. The dependency arrow points connectors → core, never the reverse. The
    core package must remain importable without the connectors package even
    existing.
@@ -17,20 +20,17 @@ import inspect
 import pkgutil
 
 from greenbean.connectors.github import (
-    GitHubConnector,
     GitHubCredentials,
     GitHubRepoInfo,
-    GitHubWriter,
     WebhookNotifier,
 )
+from greenbean.connectors.github.token_credentials import TokenCredentials
 from greenbean.core.connectors import (
     ChangeNotifier,
-    Connector,
     RepoCredentials,
     RepoRef,
-    RepoWriter,
-    SupportsPullRequests,
 )
+from greenbean.core.git import GitService
 
 
 async def _stub_resolver(_: RepoRef) -> GitHubRepoInfo:
@@ -83,39 +83,22 @@ def test_github_credentials_satisfies_repo_credentials() -> None:
     )
 
 
+def test_token_credentials_satisfies_repo_credentials() -> None:
+    instance = TokenCredentials(token="x", git=GitService())
+    assert _assignable(instance, RepoCredentials)
+    _assert_method_signature_matches_protocol(
+        instance, RepoCredentials, "get_clone_url"
+    )
+    _assert_method_signature_matches_protocol(
+        instance, RepoCredentials, "get_branch_head"
+    )
+
+
 def test_webhook_notifier_satisfies_change_notifier() -> None:
     instance = WebhookNotifier(webhook_secret="secret")
     assert _assignable(instance, ChangeNotifier)
     _assert_method_signature_matches_protocol(instance, ChangeNotifier, "subscribe")
     _assert_method_signature_matches_protocol(instance, ChangeNotifier, "unsubscribe")
-
-
-def test_github_writer_satisfies_repo_writer() -> None:
-    instance = GitHubWriter(app_id="1", private_key=b"")
-    assert _assignable(instance, RepoWriter)
-    _assert_method_signature_matches_protocol(
-        instance, RepoWriter, "open_pull_request"
-    )
-
-
-def test_github_writer_advertises_pull_request_capability() -> None:
-    """Optional capabilities use ``@runtime_checkable`` and ``isinstance``."""
-    instance = GitHubWriter(app_id="1", private_key=b"")
-    assert isinstance(instance, SupportsPullRequests)
-
-
-def test_github_connector_satisfies_connector_protocol() -> None:
-    connector = GitHubConnector(
-        app_id="1",
-        private_key=b"",
-        webhook_secret="secret",
-        repo_resolver=_stub_resolver,
-    )
-    assert _assignable(connector, Connector)
-    assert connector.name == "github"
-    assert _assignable(connector.notifier, ChangeNotifier)
-    assert _assignable(connector.credentials, RepoCredentials)
-    assert _assignable(connector.writer, RepoWriter)
 
 
 def test_core_does_not_import_connectors() -> None:

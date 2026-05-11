@@ -1,5 +1,11 @@
 """GitHub ``RepoCredentials`` — GitHub App installation auth.
 
+**Deprecated for v1.** The v1 CLI uses ``TokenCredentials`` (a single PAT) for
+all GitHub interactions. This module is kept in the tree as the seam for a
+future SaaS / GitHub App / GitHub Actions deployment — when that work
+resumes, this is the auth path it will use. It is not wired into any v1 code
+path; tests exist to keep the JWT + installation-token flow honest.
+
 Mints short-lived installation tokens via the GitHub App API and uses them to
 build authenticated clone URLs and to look up branch HEADs for the
 reconciliation cron. Tokens are held in memory only; nothing is persisted to

@@ -1,28 +1,29 @@
 """Connection-layer interfaces.
 
-Platform abstraction boundary -> to be implemented for each platform (GitHub, Local Agent, etc.)
+Platform abstraction boundary — to be implemented for each platform (GitHub
+App, GitHub Actions, future hosts) when those deployments come online.
 
 The connector exposes only what's *genuinely platform-specific* — the things a
 hosting platform does that ``git`` alone can't. Everything else (reading
 files, diffing, listing trees, inspecting commits) is a ``git`` operation on
 the working copy and lives in a separate Git service, not here.
 
-Three small interfaces, each doing one platform-specific thing:
+Two protocols, each doing one platform-specific thing:
 
 - ``ChangeNotifier`` — emits change events when a tracked branch advances.
 - ``RepoCredentials`` — mints platform auth and answers branch-HEAD lookups.
-- ``RepoWriter`` — publishes generated docs back to the customer's repo.
 
-Optional capabilities (check runs, commit comments, PR reviews) live in
-separate ``Supports*`` protocols. Core code feature-detects with
-``isinstance``; it must never assume any of them.
+There is no ``RepoWriter`` here: greenbean does not publish docs back to the
+source repo. Generated docs are written to a local output directory outside
+the repo (see ``cli.py``); future external publishers (static site, separate
+docs repo, etc.) consume that directory.
 """
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Protocol
 
 # ---------------------------------------------------------------------------
 # Value types
@@ -52,12 +53,6 @@ class ChangeEvent:
     before_sha: str | None  # ``None`` for the very first event on a repo
     after_sha: str
     triggered_by: str  # e.g. "webhook", "reconciliation", "manual"
-
-
-@dataclass(frozen=True, slots=True)
-class FileToWrite:
-    path: str
-    content: bytes
 
 
 # ---------------------------------------------------------------------------
@@ -99,116 +94,3 @@ class RepoCredentials(Protocol):
     async def get_branch_head(self, repo: RepoRef, branch: str) -> str:
         """Return the commit SHA that ``branch`` currently points at on the host."""
         ...
-
-
-class RepoWriter(Protocol):
-    """Publishes generated docs back to the customer's repo.
-
-    The required surface is intentionally minimal: open a pull request with a
-    set of file writes. Connectors that do not natively support PRs (e.g. a
-    local-agent writer) can implement this by writing to a local branch and
-    delegating push/PR creation to the user.
-    """
-
-    async def open_pull_request(
-        self,
-        repo: RepoRef,
-        branch_name: str,
-        files: Iterable[FileToWrite],
-        title: str,
-        body: str,
-        base_branch: str | None = None,
-    ) -> str:
-        """Open a PR and return its URL."""
-        ...
-
-
-# ---------------------------------------------------------------------------
-# Optional capability protocols
-# ---------------------------------------------------------------------------
-#
-# Connectors implement these only when the host supports them. Core code
-# feature-detects with ``isinstance``; it must never assume any of them.
-
-
-@runtime_checkable
-class SupportsPullRequests(Protocol):
-    """Marker: the writer publishes via real pull requests, not direct push."""
-
-    async def open_pull_request(
-        self,
-        repo: RepoRef,
-        branch_name: str,
-        files: Iterable[FileToWrite],
-        title: str,
-        body: str,
-        base_branch: str | None = None,
-    ) -> str: ...
-
-
-@runtime_checkable
-class SupportsCheckRuns(Protocol):
-    """Host can attach check runs (status badges) to a commit or PR."""
-
-    async def post_check_run(
-        self,
-        repo: RepoRef,
-        sha: str,
-        name: str,
-        conclusion: str,  # "success" | "failure" | "neutral" | ...
-        summary: str,
-        details_url: str | None = None,
-    ) -> None: ...
-
-
-@runtime_checkable
-class SupportsCommitComments(Protocol):
-    """Host can attach comments to commits or PR diffs."""
-
-    async def post_commit_comment(
-        self,
-        repo: RepoRef,
-        sha: str,
-        body: str,
-        path: str | None = None,
-        line: int | None = None,
-    ) -> None: ...
-
-
-@runtime_checkable
-class SupportsPullRequestReviews(Protocol):
-    """Host supports posting structured PR reviews (approve / request changes / comment)."""
-
-    async def post_pull_request_review(
-        self,
-        repo: RepoRef,
-        pr_number: int,
-        event: str,  # "APPROVE" | "REQUEST_CHANGES" | "COMMENT"
-        body: str,
-    ) -> None: ...
-
-
-# ---------------------------------------------------------------------------
-# Connector aggregate
-# ---------------------------------------------------------------------------
-
-
-class Connector(Protocol):
-    """Bundle of the three required interfaces for one host.
-
-    A connector is the unit a customer enables — "GitHub", "Local Agent" — and
-    it composes a ``ChangeNotifier``, a ``RepoCredentials`` and a
-    ``RepoWriter``. Optional capabilities are discovered via ``isinstance``
-    checks against the individual components.
-    """
-
-    name: str  # e.g. "github"
-
-    @property
-    def notifier(self) -> ChangeNotifier: ...
-
-    @property
-    def credentials(self) -> RepoCredentials: ...
-
-    @property
-    def writer(self) -> RepoWriter: ...
