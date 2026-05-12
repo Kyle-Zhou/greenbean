@@ -17,6 +17,11 @@ from greenbean.connectors.github import url as github_url
         ("http://github.com/acme/widgets", "acme", "widgets"),
         ("git@github.com:acme/widgets.git", "acme", "widgets"),
         ("git@github.com:acme/widgets", "acme", "widgets"),
+        # Credentialed HTTPS: what `git remote get-url` returns after a PAT clone.
+        # Must parse so generated docs land under github.com/<owner>/<name>/...
+        # rather than the _local/... fallback.
+        ("https://x-access-token:TOKEN@github.com/acme/widgets.git", "acme", "widgets"),
+        ("https://user:pass@github.com/acme/widgets", "acme", "widgets"),
     ],
 )
 def test_parse_accepts_common_forms(raw: str, owner: str, name: str) -> None:

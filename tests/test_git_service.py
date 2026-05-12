@@ -112,3 +112,26 @@ def test_fetch_and_reset_against_advancing_remote(
 
     assert asyncio.run(fetch_and_reset()) == new_sha
     assert (dest / "second.txt").read_text() == "two\n"
+
+
+def test_remote_url_returns_origin_url(
+    remote_repo: tuple[Path, str], tmp_path: Path
+) -> None:
+    bare, _ = remote_repo
+    dest = tmp_path / "checkout"
+    git = GitService()
+
+    asyncio.run(git.clone(str(bare), dest, depth=1, branch="main"))
+    url = asyncio.run(git.remote_url(dest))
+
+    assert url == str(bare)
+
+
+def test_remote_url_raises_when_remote_missing(tmp_path: Path) -> None:
+    repo = tmp_path / "norems"
+    repo.mkdir()
+    _run("git", "init", "-q", "-b", "main", str(repo))
+    git = GitService()
+
+    with pytest.raises(GitError):
+        asyncio.run(git.remote_url(repo))
