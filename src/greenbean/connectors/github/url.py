@@ -5,6 +5,8 @@ Accepts the common forms users actually paste:
 - ``https://github.com/owner/name``
 - ``https://github.com/owner/name.git``
 - ``https://github.com/owner/name/`` (trailing slash)
+- ``https://x-access-token:TOKEN@github.com/owner/name.git`` (credentialed —
+  what ``git remote get-url`` returns after a PAT clone)
 - ``git@github.com:owner/name.git``
 """
 
@@ -45,7 +47,11 @@ def try_parse(url: str) -> GitHubRepoUrl | None:
     p = urllib.parse.urlparse(url)
     if p.scheme not in ("http", "https"):
         return None
-    if p.netloc.lower() not in ("github.com", "www.github.com"):
+    # ``hostname`` strips userinfo (and port) — important for the
+    # ``https://x-access-token:TOKEN@github.com/...`` form that ``git remote
+    # get-url`` returns after a PAT clone.
+    host = (p.hostname or "").lower()
+    if host not in ("github.com", "www.github.com"):
         return None
     parts = [seg for seg in p.path.split("/") if seg]
     if len(parts) < 2:

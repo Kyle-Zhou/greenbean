@@ -1,13 +1,19 @@
 """GitHub ``ChangeNotifier`` backed by ``push`` webhooks.
 
+**Deprecated for v1.** The v1 CLI gets change notifications from the polling
+loop in ``greenbean watch`` (``git fetch`` + HEAD comparison on an interval).
+This module is kept as the seam for a future SaaS / GitHub App deployment
+where webhooks are the right notifier. It is not wired into any v1 code
+path.
+
 The HTTP receiver is wired in elsewhere (FastAPI app); it validates the HMAC
 signature, parses the payload, and feeds verified ``ChangeEvent`` instances
 into ``dispatch``. From there each registered subscriber callback runs in
 turn — deduplication on ``(repo.id, after_sha)`` is the orchestrator's job,
 not the notifier's.
 
-Implementation status: scaffold only in v1. Methods currently raise
-``NotImplementedError`` until webhook plumbing is wired in.
+Implementation status: scaffold only. Methods currently raise
+``NotImplementedError`` until webhook plumbing is wired in (post-SaaS gate).
 """
 
 from __future__ import annotations

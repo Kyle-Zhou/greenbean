@@ -4,22 +4,24 @@ Guidance for Claude (and other agentic coding tools) working in this repository.
 
 ## What this project is
 
-An agentic platform that keeps a repository's documentation continuously in sync with its code. When code changes, the system detects which docs are affected, regenerates them with an LLM-driven agent, validates the output, and publishes the result back to the repo as a pull request. The same engine doubles as a Q&A agent over the codebase and its docs.
+An agentic platform that keeps a repository's documentation continuously in sync with its code. When code changes, the system detects which docs are affected, regenerates them with an LLM-driven agent, validates the output, and **publishes the result to a local doc store outside the source repo** (under `~/.greenbean/output/...`), where it's viewable on its own surface. The customer's repo is read-only input — greenbean does not commit, branch, or PR docs back to it. The same engine doubles as a Q&A agent over the codebase and its docs.
 
 See `Architecture.md` for the full design. This file is the operating manual for working in the codebase.
 
 ## Current build frontier
 
-v1 ships **single-tenant CLI mode first.** The entry point is `greenbean clone <url> [--token $PAT]` (`src/greenbean/cli.py`); credentials go through `TokenCredentials` (`connectors/github/token_credentials.py`); the working copy lands under `~/.greenbean/cache/<host>/<owner>/<name>/`. This is the path the agent and tool layers will operate on as those steps come online — `Architecture.md` §12 has the full ordering.
+v1 ships a **local end-to-end automation loop.** The shape: `greenbean clone` → `plan init` → `generate` → (next) `run` / `watch`. `clone` uses `TokenCredentials` (`connectors/github/token_credentials.py`) and lands the working copy under `~/.greenbean/cache/<host>/<owner>/<name>/`. `plan init` populates a SQLite state file (`.greenbean/state.sqlite` next to the working copy by default). `generate` runs the agent and writes generated docs to `~/.greenbean/output/<host>/<owner>/<name>/<doc-path>`. The next step is wiring `greenbean run` (one-shot full loop) and `greenbean watch <repo-path> --interval N` (polling wrapper that does `git fetch` and re-invokes `run` when HEAD moves) — see `Architecture.md` §12 step 5.
 
-**Multi-tenant SaaS infra is deferred.** `GitHubCredentials` (App + JWT + installation-token mint) is scaffolded but inactive; webhooks, reconciliation cron, advisory locks, Postgres-backed working-copy cache, and per-tenant disk isolation are explicitly *not* built yet — they're step 6 of the build order, gated on the agent demonstrably producing docs that get merged. **Don't add tenant-aware plumbing in core paths until then.** If a change feels like it's "for when we go multi-tenant," push back on the timing and flag it on the PR.
+**Generated docs do not go back to the source repo. Ever.** No PR writer, no `git push`, no commit on the customer's behalf. The output dir is the v1 publishing surface; future external publishers (static site, separate docs repo, GitHub Pages bot) consume that directory.
+
+**SaaS / GitHub App / GitHub Actions are deferred but scaffolded.** `GitHubCredentials` (App + JWT + installation-token mint) and `WebhookNotifier` (push-webhook ingress) live in `connectors/github/` with deprecated-for-v1 banners. They're not wired into any v1 code path; they exist so the SaaS deployment doesn't have to start from a blank file when that work resumes. **Don't add tenant-aware plumbing or webhook plumbing in core paths until then.** If a change feels like it's "for when we go multi-tenant" or "for when we ship the App," push back on the timing and flag it on the PR.
 
 ## Design principles (non-negotiable)
 
 These are the spine of the system. Don't violate them without an explicit conversation:
 
-1. **The connector is *only* what's platform-specific.** v1 ships GitHub-hosted only, but the abstraction must support future local-agent and other-host connectors. What lives behind the connector: auth, change notifications, PR creation, branch HEAD lookups. What does *not* live behind the connector: file reads, diffs, tree listings, commit metadata — those are `git` operations on a working copy, and `git` is already a perfectly good abstraction for them. If you find yourself adding a connector method to do something `git` already does, that's the wrong layer.
-2. **The repo is the published surface; Postgres is the operational substrate.** Customer-facing docs are Markdown committed to the customer's repo via PR. Everything *about* docs (doc plan, source-to-doc map, generation metadata, embeddings, sync state) lives in Postgres. Don't blur this line.
+1. **The connector is *only* what's platform-specific.** v1 ships GitHub-hosted only, but the abstraction must support future SaaS / GitHub App / GitHub Actions / local-agent / other-host connectors. What lives behind the connector: auth and change notifications. What does *not* live behind the connector: file reads, diffs, tree listings, commit metadata (those are `git` operations on a working copy, and `git` is already a perfectly good abstraction); and **publishing** (the output dir is a plain filesystem write — not platform-specific, no `RepoWriter`). If you find yourself adding a connector method to do something `git` already does, or to publish docs, that's the wrong layer.
+2. **The source repo is read-only input; the output dir is the published surface.** Customer repos are cloned, read, grepped, and AST-parsed — never written to. Generated docs land in `~/.greenbean/output/<host>/<owner>/<name>/` for v1; external publishers can read from there. Operational state (doc plan, source-to-doc map, generation metadata, embeddings, sync state) lives in SQLite in CLI mode, Postgres later. Don't blur these lines: don't write to the customer's repo, and don't put doc *content* in the state store.
 3. **Grep beats RAG for code.** Structured search (ripgrep, tree-sitter, git) is the primary retrieval mechanism. Embeddings are a supplementary navigation aid for when the agent doesn't yet know what to search for. Don't reach for vector search as a default.
 4. **Generation is a function of change, not of code.** Steady-state runs are "main moved from SHA A to SHA B; what changes?" Avoid full-repo regenerations except on initial onboarding.
 5. **No execution of customer code in v1.** Read-only static analysis only — `read`, `grep`, `git log`, tree-sitter. No `npm install`, no running scripts, no test execution. Crossing this line requires real sandboxing infra and an explicit decision.
@@ -29,21 +31,21 @@ These are the spine of the system. Don't violate them without an explicit conver
 ## Architectural shape
 
 ```
-Connection → Sync → Planning → Triage → Agent Runtime → Publishing
-                                              │
-                                              ▼
-                                          Q&A API
+Connection → Sync → Planning → Triage → Agent Runtime → Output dir
+                                              │              │
+                                              ▼              ▼
+                                          Q&A API   (external publishers)
 
 (Git service is shared across Sync, Planning, and Agent Runtime)
 ```
 
-- **Connection Layer** — `ChangeNotifier`, `RepoCredentials`, `RepoWriter`. Two `RepoCredentials` impls live side by side: `TokenCredentials` (BYO PAT, what the CLI uses today) and `GitHubCredentials` (GitHub App + JWT, scaffolded for SaaS). Only platform-specific things (auth, webhooks, PR creation) live here — *not* file reads, diffs, or commit lookups; those are Git operations on a working copy. Optional capabilities (`SupportsCheckRuns`, etc.) are feature-detected, not assumed.
+- **Connection Layer** — two protocols: `ChangeNotifier` and `RepoCredentials`. There is no `RepoWriter` (no publishing back to the source repo) and no `Connector` aggregate. Two `RepoCredentials` impls live side by side: `TokenCredentials` (BYO PAT, what the CLI uses today) and `GitHubCredentials` (GitHub App + JWT, scaffolded but **deprecated for v1** — kept as the future-SaaS seam). `WebhookNotifier` is the same: scaffolded, deprecated for v1, future SaaS only. Only platform-specific things (auth, change notification) live here — *not* file reads, diffs, commit lookups (those are Git operations on a working copy), and *not* publishing (that's a plain filesystem write into the output dir).
 - **Git service** — thin shell-out wrapper around `git` (or libgit2). Used by sync, planning, and the tool layer. Not part of the connector — same on every platform.
-- **Sync Layer** — receives change events (webhook + reconciliation), manages the per-tenant working-copy cache, computes diffs, tracks `last_synced_sha`. Idempotent on `(repo_id, after_sha)`.
-- **Planning** — maintains the doc plan and the source-to-doc map; resolves a diff to a candidate set of affected docs. Lightweight, mostly mechanical.
+- **Sync Layer** — receives change events. CLI: a `greenbean watch` tick (poll-driven) or a manual `greenbean run`. SaaS (future): webhook + reconciliation. Manages the working-copy cache, computes diffs, tracks `last_synced_sha`. Idempotent on `(repo_id, after_sha)`.
+- **Planning** — maintains the doc plan and the source-to-doc map; resolves a diff to a candidate set of affected docs. Lightweight, mostly mechanical. Backed by SQLite in CLI mode, Postgres later.
 - **Triage Classifier** — cheap model that gates the expensive generator: `regenerate | targeted_edit | no_op` per candidate.
 - **Agent Runtime** — tool layer (read/grep/find_symbol/git, on-demand discovery), generator (capable model, agentic loop), validator. Same runtime serves doc generation and Q&A with different prompts.
-- **Publishing** — PR builder + writer, batched per generation cycle.
+- **Output dir** — `~/.greenbean/output/<host>/<owner>/<name>/<doc-path>`. Plain Markdown files mirroring planned doc paths. SQLite tracks metadata only (content hash, last generated, model, tokens). External publishers (static site, separate docs repo, Pages) consume this dir; they're out of greenbean's process.
 
 Schema, exact file layout, language choices, and prompt structure are deliberately not pinned here. They will evolve. The interfaces between layers are what matters.
 
@@ -75,7 +77,7 @@ Anything that consumes a webhook or processes a `(repo_id, to_sha)` pair must be
 
 ### Logging
 
-Per-job structured logs: tools called, tokens consumed, validation outcomes, final PR. Per-doc lineage: which jobs wrote it, in what order. When something goes wrong with a doc, we should be able to reconstruct what the agent saw.
+Per-job structured logs: tools called, tokens consumed, validation outcomes, output path written. Per-doc lineage: which jobs wrote it, in what order. When something goes wrong with a doc, we should be able to reconstruct what the agent saw.
 
 ## Working with the agent runtime
 
@@ -89,19 +91,26 @@ When modifying or extending the agent:
 ## Working with storage
 
 - Schema is open-ended; the design doc has a sketch, not a contract. Migrate when needed.
-- Two firm rules:
-  1. Postgres is the truth about *system state*. The repo is the truth about *what's been published to the customer*. Don't mix these.
-  2. The working-copy cache on disk is ephemeral. Anything that can't be reconstructed by re-cloning is a bug.
+- Three firm rules:
+  1. The state store (SQLite in CLI, Postgres later) is the truth about *system state* — plan, source-to-doc map, generation metadata, content hashes. Doc *content* lives in the output dir on disk, not in the state store.
+  2. The output dir (`~/.greenbean/output/...`) is the truth about *what's been published*. The customer's source repo is read-only input — never write to it.
+  3. The working-copy cache on disk is ephemeral. Anything that can't be reconstructed by re-cloning is a bug.
 
-## Things that are explicitly out of scope (right now)
+## Things that are explicitly out of scope
 
-These are good ideas. They are not v1.
+**Permanent (not "deferred"):**
 
+- **Publishing docs back to the source repo.** No PRs, no `git push`, no commits on the customer's behalf. The output dir is the publishing surface.
+
+**Deferred — good ideas, not v1:**
+
+- SaaS deployment, GitHub App auth, webhook ingress, multi-tenant disk isolation. Scaffolded in `connectors/github/credentials.py` and `connectors/github/notifier.py` (deprecated-for-v1 banners) for when this work resumes.
+- GitHub Actions integration. Same core, different packaging — comes after the local loop is solid.
+- External publishers (static site, separate docs repo, GitHub Pages bot). Plug into the output dir; out of greenbean's process.
 - Local-agent connector (architecture supports it; defer until a customer asks).
 - Executing customer code to enrich docs (tests, builds, runtime behavior).
 - Multi-repo Q&A (single-repo first; the embedding model and plumbing extend naturally later).
-- Web UI (API + GitHub PRs are the v1 surface).
-- Bidirectional sync (human edits in repo → Postgres).
+- Web UI for browsing docs (the output dir is files-on-disk; any markdown viewer works).
 - Non-GitHub hosts (GitLab, Bitbucket, self-hosted Git).
 
 If a feature request points at one of these, push back or scope it down. The point of v1 is depth on a narrow product, not breadth.

@@ -142,6 +142,11 @@ class GitService:
         )
         return _parse_blame_porcelain(out)
 
+    async def remote_url(self, repo_path: Path, name: str = "origin") -> str:
+        """Return the URL configured for ``name`` in the working copy at ``repo_path``."""
+        out = await self._run("-C", str(repo_path), "remote", "get-url", name)
+        return out.strip()
+
     async def ls_remote(self, url: str, ref: str) -> str:
         """Look up the SHA that ``ref`` resolves to on the remote at ``url``.
 
