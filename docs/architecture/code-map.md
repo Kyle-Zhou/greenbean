@@ -12,7 +12,7 @@ The customer's source repo is read-only input. Generated docs land in `~/.greenb
 
 - `src/greenbean/cli.py`
   - v1 entrypoints: `greenbean clone`, `greenbean plan init|list`, `greenbean generate`.
-  - `_output_root_for(repo_path, git)` resolves the per-repo output root from the working copy's `origin` URL; falls back to `_local/<basename>` for unrecognized remotes.
+  - `_output_root_for(repo_path, git)` resolves the per-repo output root from the working copy's `origin` URL; falls back to `_local/<basename>-<path-hash>` for unrecognized remotes (the hash suffix prevents collisions when two working copies share a directory name).
   - `greenbean run` and `greenbean watch` (the full automation loop) are next — see Architecture.md §12 step 5.
 - `src/greenbean/core/connectors.py`
   - Platform abstraction boundary.

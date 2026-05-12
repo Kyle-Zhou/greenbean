@@ -223,7 +223,7 @@ def test_atomic_write_replaces_existing_file(tmp_path: Path) -> None:
 def test_atomic_write_cleans_up_temp_on_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """If the rename fails, the .tmp file must not leak."""
+    """If the rename fails, the temp file must not leak."""
     target = tmp_path / "doc.md"
 
     def _boom(src: str, dst: str) -> None:
@@ -236,3 +236,22 @@ def test_atomic_write_cleans_up_temp_on_failure(
 
     siblings = list(tmp_path.iterdir())
     assert siblings == [], f"temp file leaked: {siblings}"
+
+
+def test_atomic_write_uses_unique_temp_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent writes to the same target must not collide on the temp name.
+
+    Stub ``os.replace`` to a no-op so successive calls leave their temp files
+    in place; verify each call produced a distinct temp filename.
+    """
+    target = tmp_path / "doc.md"
+    monkeypatch.setattr(cli.os, "replace", lambda src, dst: None)
+
+    for i in range(3):
+        cli._atomic_write_text(target, str(i))
+
+    tmps = sorted(tmp_path.iterdir())
+    assert len(tmps) == 3, f"expected 3 unique temp files, got {tmps}"
+    assert len({t.name for t in tmps}) == 3

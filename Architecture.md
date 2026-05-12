@@ -425,7 +425,7 @@ The publish step is a filesystem write:
 ~/.greenbean/output/<host>/<owner>/<name>/<doc-path>
 ```
 
-For a repo at `~/.greenbean/cache/github.com/foo/bar/`, the README lands at `~/.greenbean/output/github.com/foo/bar/README.md`. Subdirectory READMEs mirror the planned `path_in_repo`. The output root is resolved by reading the working copy's `origin` URL via `GitService.remote_url`; when the URL doesn't parse as GitHub, the fallback is `~/.greenbean/output/_local/<basename>/`.
+For a repo at `~/.greenbean/cache/github.com/foo/bar/`, the README lands at `~/.greenbean/output/github.com/foo/bar/README.md`. Subdirectory READMEs mirror the planned `path_in_repo`. The output root is resolved by reading the working copy's `origin` URL via `GitService.remote_url`; when the URL doesn't parse as GitHub, the fallback is `~/.greenbean/output/_local/<basename>-<path-hash>/` (the hash suffix is an 8-char sha256 of the resolved working-copy path — keeps two repos that share a directory name from clobbering each other).
 
 Generated content writes are atomic per file (write temp, rename) and accompanied by a `record_generation` call into the SQLite store: content hash, model, tokens, tool-call count.
 

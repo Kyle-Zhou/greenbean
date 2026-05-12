@@ -25,6 +25,7 @@ import asyncio
 import hashlib
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 from greenbean.agent import Generator
@@ -45,15 +46,23 @@ _DEFAULT_STATE_NAME = ".greenbean/state.sqlite"
 def _atomic_write_text(path: Path, content: str) -> None:
     """Write ``content`` to ``path`` atomically.
 
-    Writes to a sibling temp file then ``os.replace``s into position. The
-    temp lives on the same filesystem as the target so the rename is atomic
-    on POSIX. Prevents partial files on disk-full, SIGTERM mid-write, or
-    crash.
+    Writes to a uniquely-named sibling temp file then ``os.replace``s into
+    position. The temp lives on the same filesystem as the target so the
+    rename is atomic on POSIX. Prevents partial files on disk-full, SIGTERM
+    mid-write, or crash. The unique temp name also keeps two concurrent
+    callers (two processes, future parallel generation) from clobbering
+    each other's in-flight write.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    tmp = Path(tmp_name)
     try:
-        tmp.write_text(content, encoding="utf-8")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
         os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)
