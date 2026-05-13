@@ -2,12 +2,11 @@
 
 These tests guard two invariants:
 
-1. The GitHub stubs (``GitHubCredentials``, ``WebhookNotifier``) structurally
-   satisfy the core protocols. If someone adds a new method to
-   ``RepoCredentials`` and forgets to update the GitHub implementation, this
-   catches it before it reaches a runtime call site. The stubs are
-   deprecated for v1 but kept for the future SaaS deployment, so the
-   conformance check stays.
+1. The GitHub ``RepoCredentials`` implementations (``TokenCredentials`` and
+   the deprecated-but-preserved ``GitHubCredentials``) structurally satisfy
+   the core protocol. If someone adds a new method to ``RepoCredentials`` and
+   forgets to update an implementation, this catches it before it reaches a
+   runtime call site.
 2. The dependency arrow points connectors → core, never the reverse. The
    core package must remain importable without the connectors package even
    existing.
@@ -22,11 +21,9 @@ import pkgutil
 from greenbean.connectors.github import (
     GitHubCredentials,
     GitHubRepoInfo,
-    WebhookNotifier,
 )
 from greenbean.connectors.github.token_credentials import TokenCredentials
 from greenbean.core.connectors import (
-    ChangeNotifier,
     RepoCredentials,
     RepoRef,
 )
@@ -92,13 +89,6 @@ def test_token_credentials_satisfies_repo_credentials() -> None:
     _assert_method_signature_matches_protocol(
         instance, RepoCredentials, "get_branch_head"
     )
-
-
-def test_webhook_notifier_satisfies_change_notifier() -> None:
-    instance = WebhookNotifier(webhook_secret="secret")
-    assert _assignable(instance, ChangeNotifier)
-    _assert_method_signature_matches_protocol(instance, ChangeNotifier, "subscribe")
-    _assert_method_signature_matches_protocol(instance, ChangeNotifier, "unsubscribe")
 
 
 def test_core_does_not_import_connectors() -> None:

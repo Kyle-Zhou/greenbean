@@ -14,13 +14,15 @@ v1 ships a **local end-to-end automation loop.** The shape: `greenbean clone` �
 
 **Generated docs do not go back to the source repo. Ever.** No PR writer, no `git push`, no commit on the customer's behalf. The output dir is the v1 publishing surface; future external publishers (static site, separate docs repo, GitHub Pages bot) consume that directory.
 
-**SaaS / GitHub App / GitHub Actions are deferred but scaffolded.** `GitHubCredentials` (App + JWT + installation-token mint) and `WebhookNotifier` (push-webhook ingress) live in `connectors/github/` with deprecated-for-v1 banners. They're not wired into any v1 code path; they exist so the SaaS deployment doesn't have to start from a blank file when that work resumes. **Don't add tenant-aware plumbing or webhook plumbing in core paths until then.** If a change feels like it's "for when we go multi-tenant" or "for when we ship the App," push back on the timing and flag it on the PR.
+**SaaS / GitHub App are deferred but scaffolded.** `GitHubCredentials` (App + JWT + installation-token mint) lives in `connectors/github/credentials.py` with a deprecated-for-v1 banner. It's not wired into any v1 code path; it exists so the SaaS deployment can plug it into the server-side scheduler when that work resumes. **No webhook plumbing exists** — both CLI and SaaS use polling. The CLI polls in-process via `greenbean watch`'s timer; SaaS will poll via a server-side scheduler that queries Postgres for repos due for a check. See `Architecture.md` §10.1.
+
+**Don't add tenant-aware plumbing, webhook plumbing, or `ChangeNotifier`-style abstractions in core paths.** If a change feels like it's "for when we go multi-tenant," "for when we ship the App," or "in case we want webhooks later," push back on the timing and flag it on the PR.
 
 ## Design principles (non-negotiable)
 
 These are the spine of the system. Don't violate them without an explicit conversation:
 
-1. **The connector is *only* what's platform-specific.** v1 ships GitHub-hosted only, but the abstraction must support future SaaS / GitHub App / GitHub Actions / local-agent / other-host connectors. What lives behind the connector: auth and change notifications. What does *not* live behind the connector: file reads, diffs, tree listings, commit metadata (those are `git` operations on a working copy, and `git` is already a perfectly good abstraction); and **publishing** (the output dir is a plain filesystem write — not platform-specific, no `RepoWriter`). If you find yourself adding a connector method to do something `git` already does, or to publish docs, that's the wrong layer.
+1. **The connector is *only* what's platform-specific.** v1 ships GitHub-hosted only, but the abstraction must support future SaaS / GitHub App / GitHub Actions / local-agent / other-host connectors. What lives behind the connector: **auth** (one protocol: `RepoCredentials`). What does *not* live behind the connector: file reads, diffs, tree listings, commit metadata (those are `git` operations on a working copy); **publishing** (the output dir is a plain filesystem write); and **change notification** (both modes poll — there's no `ChangeNotifier` and no webhook ingress). If you find yourself adding a connector method to do something `git` already does, to publish docs, or to receive a push notification, that's the wrong layer.
 2. **The source repo is read-only input; the output dir is the published surface.** Customer repos are cloned, read, grepped, and AST-parsed — never written to. Generated docs land in `~/.greenbean/output/<host>/<owner>/<name>/` for v1; external publishers can read from there. Operational state (doc plan, source-to-doc map, generation metadata, embeddings, sync state) lives in SQLite in CLI mode, Postgres later. Don't blur these lines: don't write to the customer's repo, and don't put doc *content* in the state store.
 3. **Grep beats RAG for code.** Structured search (ripgrep, tree-sitter, git) is the primary retrieval mechanism. Embeddings are a supplementary navigation aid for when the agent doesn't yet know what to search for. Don't reach for vector search as a default.
 4. **Generation is a function of change, not of code.** Steady-state runs are "main moved from SHA A to SHA B; what changes?" Avoid full-repo regenerations except on initial onboarding.
@@ -39,9 +41,9 @@ Connection → Sync → Planning → Triage → Agent Runtime → Output dir
 (Git service is shared across Sync, Planning, and Agent Runtime)
 ```
 
-- **Connection Layer** — two protocols: `ChangeNotifier` and `RepoCredentials`. There is no `RepoWriter` (no publishing back to the source repo) and no `Connector` aggregate. Two `RepoCredentials` impls live side by side: `TokenCredentials` (BYO PAT, what the CLI uses today) and `GitHubCredentials` (GitHub App + JWT, scaffolded but **deprecated for v1** — kept as the future-SaaS seam). `WebhookNotifier` is the same: scaffolded, deprecated for v1, future SaaS only. Only platform-specific things (auth, change notification) live here — *not* file reads, diffs, commit lookups (those are Git operations on a working copy), and *not* publishing (that's a plain filesystem write into the output dir).
+- **Connection Layer** — one protocol: `RepoCredentials`. No `RepoWriter` (no publishing back to the source repo). No `ChangeNotifier` (no push notifications — both deployments poll). Two `RepoCredentials` impls live side by side: `TokenCredentials` (BYO PAT, what the CLI uses today) and `GitHubCredentials` (GitHub App + JWT, scaffolded but **deprecated for v1** — the future-SaaS auth path). Only platform-specific things (auth) live here — *not* file reads/diffs/commit lookups (those are Git operations on a working copy), *not* publishing (filesystem write into the output dir), and *not* change notification (the trigger lives in `watch`'s in-process timer for CLI or in the server-side scheduler for SaaS).
 - **Git service** — thin shell-out wrapper around `git` (or libgit2). Used by sync, planning, and the tool layer. Not part of the connector — same on every platform.
-- **Sync Layer** — receives change events. CLI: a `greenbean watch` tick (poll-driven) or a manual `greenbean run`. SaaS (future): webhook + reconciliation. Manages the working-copy cache, computes diffs, tracks `last_synced_sha`. Idempotent on `(repo_id, after_sha)`.
+- **Sync Layer** — two triggers, one pipeline body. **CLI:** `greenbean watch`'s in-process timer ticks, calls `git fetch` on the cache, runs the pipeline if HEAD moved. **SaaS (future):** a server-side scheduler queries Postgres for repos due for a poll, calls `RepoCredentials.get_branch_head`, enqueues `sync_jobs` on drift; a stateless worker pool consumes the queue. Both modes idempotent on `(repo_id, after_sha)`.
 - **Planning** — maintains the doc plan and the source-to-doc map; resolves a diff to a candidate set of affected docs. Lightweight, mostly mechanical. Backed by SQLite in CLI mode, Postgres later.
 - **Triage Classifier** — cheap model that gates the expensive generator: `regenerate | targeted_edit | no_op` per candidate.
 - **Agent Runtime** — tool layer (read/grep/find_symbol/git, on-demand discovery), generator (capable model, agentic loop), validator. Same runtime serves doc generation and Q&A with different prompts.
@@ -73,7 +75,7 @@ We're not pinning a language stack here yet. When adding a new language or major
 
 ### Idempotency
 
-Anything that consumes a webhook or processes a `(repo_id, to_sha)` pair must be idempotent. Webhooks retry. Jobs retry. Don't assume single-delivery.
+Anything that processes a `(repo_id, after_sha)` pair must be idempotent. Polling can see the same SHA on consecutive ticks; jobs retry. Don't assume single-delivery.
 
 ### Logging
 
@@ -101,11 +103,12 @@ When modifying or extending the agent:
 **Permanent (not "deferred"):**
 
 - **Publishing docs back to the source repo.** No PRs, no `git push`, no commits on the customer's behalf. The output dir is the publishing surface.
+- **Webhook ingress.** Both deployment modes poll: CLI in-process via `greenbean watch`; SaaS server-side via a scheduler that queries Postgres for repos due for a check. Polling wins on simplicity (no HTTP ingress, no HMAC, no signature retries, no reconciliation cron — polling *is* the reconciliation) and on natural coalescing — a repo with 10 pushes inside one poll interval generates one pipeline run (we fast-forward to current HEAD), whereas webhooks land as 10 separate jobs unless you write debounce logic. The trade is latency: seconds (webhooks) vs minutes (polling). Doc generation isn't latency-sensitive — nobody is watching the doc site waiting for a refresh. If sub-minute latency ever becomes a real product need, webhooks could be bolted onto the existing `sync_jobs` queue as a fast path. Until then, don't build it. See Architecture.md §10.1 for the full reasoning.
 
 **Deferred — good ideas, not v1:**
 
-- SaaS deployment, GitHub App auth, webhook ingress, multi-tenant disk isolation. Scaffolded in `connectors/github/credentials.py` and `connectors/github/notifier.py` (deprecated-for-v1 banners) for when this work resumes.
-- GitHub Actions integration. Same core, different packaging — comes after the local loop is solid.
+- SaaS deployment, GitHub App auth, multi-tenant disk isolation, scheduler/worker pool. `GitHubCredentials` is scaffolded in `connectors/github/credentials.py` (deprecated-for-v1 banner) for when this work resumes.
+- GitHub Actions integration. Same core, different packaging — re-uses `greenbean run` + `TokenCredentials`; does not depend on SaaS infrastructure (see Architecture.md §12 step 7).
 - External publishers (static site, separate docs repo, GitHub Pages bot). Plug into the output dir; out of greenbean's process.
 - Local-agent connector (architecture supports it; defer until a customer asks).
 - Executing customer code to enrich docs (tests, builds, runtime behavior).
