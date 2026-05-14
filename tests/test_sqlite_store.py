@@ -233,6 +233,51 @@ def test_source_paths_for_no_sources_returns_empty() -> None:
         assert store.source_paths_for(doc.id) == ()
 
 
+# ----- sync state ------------------------------------------------------------
+
+
+def test_get_last_synced_sha_empty_returns_none() -> None:
+    with _store() as store:
+        assert store.get_last_synced_sha() is None
+
+
+def test_record_sync_then_get_returns_sha() -> None:
+    with _store() as store:
+        store.record_sync(SHA_A)
+        assert store.get_last_synced_sha() == SHA_A
+
+
+def test_record_sync_overwrites_previous() -> None:
+    with _store() as store:
+        store.record_sync(SHA_A)
+        store.record_sync(SHA_B)
+        assert store.get_last_synced_sha() == SHA_B
+
+
+# ----- ungenerated_documents -------------------------------------------------
+
+
+def test_ungenerated_documents_returns_never_generated_docs() -> None:
+    with _store() as store:
+        store.replace_plan(
+            [
+                _make_planned("README.md"),
+                _make_planned("docs/architecture.md"),
+            ],
+            SHA_A,
+        )
+        store.record_generation("README.md", content_hash="h", metadata={})
+        docs = store.ungenerated_documents()
+        assert [d.path_in_repo for d in docs] == ["docs/architecture.md"]
+
+
+def test_ungenerated_documents_empty_when_all_generated() -> None:
+    with _store() as store:
+        store.replace_plan([_make_planned("README.md")], SHA_A)
+        store.record_generation("README.md", content_hash="h", metadata={})
+        assert store.ungenerated_documents() == ()
+
+
 # ----- context manager -------------------------------------------------------
 
 

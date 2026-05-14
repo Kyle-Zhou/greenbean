@@ -38,6 +38,11 @@ CREATE TABLE IF NOT EXISTS document_sources (
   PRIMARY KEY (document_id, source_path)
 );
 CREATE INDEX IF NOT EXISTS idx_doc_sources_path ON document_sources(source_path);
+CREATE TABLE IF NOT EXISTS repo_sync_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  last_synced_sha TEXT NOT NULL,
+  last_synced_at TEXT NOT NULL
+);
 """
 
 
@@ -236,6 +241,37 @@ class SqliteDocStore:
             (content_hash, now, json.dumps(dict(metadata)), path_in_repo),
         )
         self._con.commit()
+
+    # ----- sync state --------------------------------------------------------
+
+    def get_last_synced_sha(self) -> str | None:
+        """The SHA the pipeline last completed against, or None if it never has."""
+        row = self._con.execute(
+            "SELECT last_synced_sha FROM repo_sync_state WHERE id = 1"
+        ).fetchone()
+        return row["last_synced_sha"] if row else None
+
+    def record_sync(self, sha: str) -> None:
+        """Mark ``sha`` as the latest pipeline-completed SHA."""
+        now = datetime.now(UTC).isoformat()
+        self._con.execute(
+            """
+            INSERT INTO repo_sync_state (id, last_synced_sha, last_synced_at)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE
+              SET last_synced_sha = excluded.last_synced_sha,
+                  last_synced_at = excluded.last_synced_at
+            """,
+            (sha, now),
+        )
+        self._con.commit()
+
+    def ungenerated_documents(self) -> Sequence[Document]:
+        """Docs in the plan that have never been generated (``last_generated_at IS NULL``)."""
+        rows = self._con.execute(
+            "SELECT * FROM documents WHERE last_generated_at IS NULL ORDER BY path_in_repo"
+        ).fetchall()
+        return tuple(_row_to_document(r) for r in rows)
 
     # ----- lifecycle ---------------------------------------------------------
 

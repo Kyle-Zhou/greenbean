@@ -127,6 +127,53 @@ def test_remote_url_returns_origin_url(
     assert url == str(bare)
 
 
+def test_diff_returns_changed_paths(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run("git", "init", "-q", "-b", "main", str(repo))
+    _run("git", "-C", str(repo), "config", "user.email", "test@example.com")
+    _run("git", "-C", str(repo), "config", "user.name", "test")
+    (repo / "a.py").write_text("a\n")
+    (repo / "b.py").write_text("b\n")
+    _run("git", "-C", str(repo), "add", "a.py", "b.py")
+    _run("git", "-C", str(repo), "commit", "-q", "-m", "init")
+    first = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    (repo / "a.py").write_text("a-changed\n")
+    (repo / "c.py").write_text("c\n")
+    _run("git", "-C", str(repo), "rm", "-q", "b.py")
+    _run("git", "-C", str(repo), "add", "a.py", "c.py")
+    _run("git", "-C", str(repo), "commit", "-q", "-m", "second")
+    second = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    paths = asyncio.run(GitService().diff(repo, first, second))
+    assert set(paths) == {"a.py", "b.py", "c.py"}
+
+
+def test_diff_returns_empty_for_same_sha(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run("git", "init", "-q", "-b", "main", str(repo))
+    _run("git", "-C", str(repo), "config", "user.email", "test@example.com")
+    _run("git", "-C", str(repo), "config", "user.name", "test")
+    (repo / "x.py").write_text("x\n")
+    _run("git", "-C", str(repo), "add", "x.py")
+    _run("git", "-C", str(repo), "commit", "-q", "-m", "init")
+    sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    paths = asyncio.run(GitService().diff(repo, sha, sha))
+    assert paths == ()
+
+
 def test_remote_url_raises_when_remote_missing(tmp_path: Path) -> None:
     repo = tmp_path / "norems"
     repo.mkdir()

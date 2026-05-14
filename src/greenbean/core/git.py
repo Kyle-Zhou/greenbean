@@ -142,6 +142,25 @@ class GitService:
         )
         return _parse_blame_porcelain(out)
 
+    async def diff(
+        self, repo_path: Path, from_sha: str, to_sha: str
+    ) -> Sequence[str]:
+        """Return the file paths changed between ``from_sha`` and ``to_sha``.
+
+        Uses ``git diff --name-only`` — includes adds, deletes, and modifies,
+        and reports renames as both the old and new path so a doc scoped to
+        either side is still flagged as affected.
+        """
+        out = await self._run(
+            "-C",
+            str(repo_path),
+            "diff",
+            "--name-only",
+            "--no-renames",
+            f"{from_sha}..{to_sha}",
+        )
+        return tuple(line for line in out.splitlines() if line.strip())
+
     async def remote_url(self, repo_path: Path, name: str = "origin") -> str:
         """Return the URL configured for ``name`` in the working copy at ``repo_path``."""
         out = await self._run("-C", str(repo_path), "remote", "get-url", name)
