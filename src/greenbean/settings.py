@@ -19,7 +19,8 @@ from dataclasses import dataclass
 from greenbean.core.llm import LLMClient
 
 _DEFAULT_GENERATOR_PROVIDER = "anthropic"
-_DEFAULT_GENERATOR_MODEL = "claude-sonnet-4-6"
+# _DEFAULT_GENERATOR_MODEL = "claude-sonnet-4-6"
+_DEFAULT_GENERATOR_MODEL = "claude-haiku-4-5-20251001"
 _DEFAULT_TRIAGE_PROVIDER = "anthropic"
 _DEFAULT_TRIAGE_MODEL = "claude-haiku-4-5-20251001"
 

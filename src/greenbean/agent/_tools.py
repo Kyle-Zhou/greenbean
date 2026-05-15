@@ -95,7 +95,29 @@ TOOL_SCHEMAS: list[ToolDefinition] = [
 
 
 async def dispatch_tool(name: str, tool_input: object, tools: Tools) -> str:
-    """Route a tool-use block to the appropriate Tools method; return a string result."""
+    """Route a tool-use block to the appropriate Tools method; return a string result.
+
+    Any exception raised by a tool — bad path, missing argument, ripgrep not
+    installed, anything — is caught and formatted as a string for the model.
+    The agent loop never sees the raw exception, so one bad tool call can't
+    crash a whole generation. The model receives the formatted error as a
+    ``tool_result`` and can self-correct on the next turn, which matches
+    Architecture.md §6.4's "validation failures feed back into the agent
+    loop" — the same principle applies to tool failures.
+    """
+    try:
+        return await _dispatch(name, tool_input, tools)
+    except KeyError as e:
+        # Missing required input key — the model called the tool without a
+        # required argument. Make this readable rather than a bare ``'path'``.
+        return f"error calling {name}: missing required argument {e}"
+    except Exception as e:
+        message = str(e) or type(e).__name__
+        return f"error calling {name}: {message}"
+
+
+async def _dispatch(name: str, tool_input: object, tools: Tools) -> str:
+    """Inner dispatch — kept separate so ``dispatch_tool`` is a clean wrapper."""
     inp = cast(dict[str, Any], tool_input)
 
     if name == "read_file":

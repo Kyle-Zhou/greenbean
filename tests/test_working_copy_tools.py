@@ -93,6 +93,28 @@ def test_read_file_supports_line_range(repo: Path) -> None:
     assert text == "def farewell(name):\n    return f'bye {name}'\n"
 
 
+def test_read_file_directory_raises_isadirectory(repo: Path) -> None:
+    """A directory path must raise a clearly-typed error, not silently read."""
+    tools = WorkingCopyTools(repo)
+    with pytest.raises(IsADirectoryError, match="is a directory"):
+        asyncio.run(tools.read_file("src"))
+
+
+def test_read_file_missing_raises_filenotfound(repo: Path) -> None:
+    tools = WorkingCopyTools(repo)
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        asyncio.run(tools.read_file("does/not/exist.py"))
+
+
+def test_read_file_directory_error_message_suggests_list_directory(
+    repo: Path,
+) -> None:
+    """The directory-error message points the agent at the right tool."""
+    tools = WorkingCopyTools(repo)
+    with pytest.raises(IsADirectoryError, match="list_directory"):
+        asyncio.run(tools.read_file("src"))
+
+
 # ----- list_directory --------------------------------------------------------
 
 

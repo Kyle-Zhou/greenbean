@@ -48,6 +48,18 @@ class WorkingCopyTools:
         end: int | None = None,
     ) -> str:
         target = self._resolve_safe(path)
+        # Validate before reading so the agent gets a useful error when it
+        # passes a directory ("Use list_directory") or a path that doesn't
+        # exist. The bare stdlib exceptions would otherwise surface as
+        # ``IsADirectoryError`` / ``FileNotFoundError``, which the model
+        # doesn't reliably know how to recover from.
+        if not target.exists():
+            raise FileNotFoundError(f"path does not exist: {path!r}")
+        if not target.is_file():
+            raise IsADirectoryError(
+                f"{path!r} is a directory, not a file. "
+                "Use list_directory to inspect its contents."
+            )
         text = await asyncio.to_thread(target.read_text, encoding="utf-8", errors="replace")
         if start is None and end is None:
             return text
