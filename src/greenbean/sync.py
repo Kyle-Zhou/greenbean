@@ -22,6 +22,8 @@ the CLI today; a server-side queue worker in future SaaS).
 from __future__ import annotations
 
 import hashlib
+import logging
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,6 +33,8 @@ from greenbean.core.git import GitService
 from greenbean.core.planning import Document, PlannedDoc
 from greenbean.io import _atomic_write_text, _safe_output_path
 from greenbean.planning import DefaultPlanner, SqliteDocStore
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,11 +126,20 @@ async def run_pipeline(
     """
     to_sha = await git.current_sha(repo_path)
     from_sha = store.get_last_synced_sha()
+    logger.info(
+        "pipeline: %s -> %s",
+        from_sha[:8] if from_sha else "(initial)",
+        to_sha[:8],
+    )
 
     added, updated, pruned = await _refresh_plan(repo_path, planner, store, to_sha)
+    logger.info(
+        "plan refresh: %d added, %d updated, %d pruned", added, updated, pruned
+    )
 
     if from_sha is not None and from_sha != to_sha:
         changed_paths = await git.diff(repo_path, from_sha, to_sha)
+        logger.info("diff %s..%s: %d path(s) changed", from_sha[:8], to_sha[:8], len(changed_paths))
     else:
         changed_paths = ()
 
@@ -137,6 +150,7 @@ async def run_pipeline(
         # We still record the sync sha so the first-ever ``run`` against a
         # fully-generated plan stops scanning the diff window on subsequent
         # ticks.
+        logger.info("no docs to regenerate")
         store.record_sync(to_sha)
         return RunSummary(
             from_sha=from_sha,
@@ -147,10 +161,25 @@ async def run_pipeline(
             pruned=pruned,
         )
 
+    total = len(targets)
+    logger.info("regenerating %d doc(s)", total)
     regenerated: list[str] = []
-    for doc in targets:
+    for i, doc in enumerate(targets, start=1):
         source_paths = store.source_paths_for(doc.id)
+        logger.info("[%d/%d] generating %s", i, total, doc.path_in_repo)
+        started_at = time.monotonic()
         result = await generator.generate(doc, source_paths)
+        elapsed = time.monotonic() - started_at
+        logger.info(
+            "[%d/%d] done %s in %.1fs (%d tool calls, %d+%d tokens)",
+            i,
+            total,
+            doc.path_in_repo,
+            elapsed,
+            result.tool_calls,
+            result.input_tokens,
+            result.output_tokens,
+        )
         out_path = _safe_output_path(output_root, doc.path_in_repo)
         _atomic_write_text(out_path, result.content)
         content_hash = hashlib.sha256(result.content.encode()).hexdigest()

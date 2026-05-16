@@ -25,8 +25,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 from greenbean.agent import Generator
@@ -45,9 +47,34 @@ from greenbean.tools.working_copy import WorkingCopyTools
 # helpers from ``greenbean.cli``. The implementations live in ``greenbean.io``.
 __all__ = ["_atomic_write_text", "_safe_output_path", "main"]
 
+logger = logging.getLogger("greenbean")
+
 DEFAULT_CACHE_ROOT = Path.home() / ".greenbean" / "cache"
 DEFAULT_OUTPUT_ROOT = Path.home() / ".greenbean" / "output"
 _DEFAULT_STATE_NAME = ".greenbean/state.sqlite"
+
+
+def _configure_logging() -> None:
+    """Install a stderr handler for ``greenbean.*`` loggers at INFO.
+
+    Stdout stays the "primary result" channel — clone summaries, plan
+    listings, run summaries. Stderr carries diagnostics — per-tool-call
+    traces, per-doc progress, warnings. The split lets a user pipe the
+    primary result somewhere (``greenbean plan list ... | jq``) without
+    progress chatter polluting it. Idempotent for repeat ``main`` calls in
+    the same process (e.g. test invocations).
+    """
+    root = logging.getLogger("greenbean")
+    if root.handlers:
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    # ``propagate = True`` is kept on purpose: pytest's ``caplog`` fixture
+    # attaches at the root logger, and propagating greenbean's logs there
+    # makes them captureable in tests without per-test wiring. Root has no
+    # handlers by default, so there's no double-emit in normal use.
 
 
 def _local_namespace(repo_path: Path) -> str:
@@ -321,13 +348,22 @@ async def _generate(args: argparse.Namespace) -> int:
             print("no documents in plan", file=sys.stderr)
             return 1
 
-        for doc in docs:
+        total = len(docs)
+        for i, doc in enumerate(docs, start=1):
             source_paths = store.source_paths_for(doc.id)
-            print(f"generating {doc.path_in_repo} ...", end=" ", flush=True)
+            logger.info("[%d/%d] generating %s", i, total, doc.path_in_repo)
+            started_at = time.monotonic()
             result = await generator.generate(doc, source_paths)
-            print(
-                f"done ({result.tool_calls} tool calls, "
-                f"{result.input_tokens}+{result.output_tokens} tokens)"
+            elapsed = time.monotonic() - started_at
+            logger.info(
+                "[%d/%d] done %s in %.1fs (%d tool calls, %d+%d tokens)",
+                i,
+                total,
+                doc.path_in_repo,
+                elapsed,
+                result.tool_calls,
+                result.input_tokens,
+                result.output_tokens,
             )
 
             if args.dry_run:
@@ -347,7 +383,7 @@ async def _generate(args: argparse.Namespace) -> int:
                         "tool_calls": result.tool_calls,
                     },
                 )
-                print(f"  wrote {out_path}")
+                logger.info("  wrote %s", out_path)
 
     return 0
 
@@ -478,7 +514,7 @@ async def _watch(args: argparse.Namespace) -> int:
                 try:
                     await git.fetch(repo_path)
                 except GitError as e:
-                    print(f"warning: fetch failed: {e}", file=sys.stderr)
+                    logger.warning("fetch failed: %s", e)
             try:
                 summary = await run_pipeline(
                     repo_path,
@@ -491,11 +527,12 @@ async def _watch(args: argparse.Namespace) -> int:
                 )
                 print(_summary_line(summary))
             except GitError as e:
-                print(f"warning: pipeline failed: {e}", file=sys.stderr)
+                logger.warning("pipeline failed: %s", e)
             await asyncio.sleep(interval)
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_logging()
     args = _build_parser().parse_args(argv)
     if args.command == "clone":
         return asyncio.run(_clone(args))

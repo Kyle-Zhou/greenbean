@@ -7,10 +7,13 @@ the model reads them as context in the next turn.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, cast
 
 from greenbean.core.llm import ToolDefinition
 from greenbean.core.tools import Tools
+
+logger = logging.getLogger(__name__)
 
 TOOL_SCHEMAS: list[ToolDefinition] = [
     ToolDefinition(
@@ -94,6 +97,32 @@ TOOL_SCHEMAS: list[ToolDefinition] = [
 ]
 
 
+def _format_tool_call(name: str, tool_input: object) -> str:
+    """Render a one-line summary of a tool call for the progress log.
+
+    Picks the single most informative input argument per tool — the path
+    for read/list operations, the pattern for grep, the path filter for
+    ``git_log`` — so the operator can scan logs and tell at a glance what
+    the agent is doing without each line ballooning into the full JSON.
+    """
+    inp = cast(dict[str, Any], tool_input) if isinstance(tool_input, dict) else {}
+    if name == "read_file":
+        path = inp.get("path", "?")
+        if inp.get("start") is not None or inp.get("end") is not None:
+            return f"read_file {path}:{inp.get('start', '')}-{inp.get('end', '')}"
+        return f"read_file {path}"
+    if name == "list_directory":
+        return f"list_directory {inp.get('path', '.')}"
+    if name == "grep":
+        pattern = inp.get("pattern", "?")
+        scope = f" in {inp['path']}" if inp.get("path") else ""
+        return f"grep {pattern!r}{scope}"
+    if name == "git_log":
+        scope = f" {inp['path']}" if inp.get("path") else ""
+        return f"git_log{scope}"
+    return f"{name} {inp}"
+
+
 async def dispatch_tool(name: str, tool_input: object, tools: Tools) -> str:
     """Route a tool-use block to the appropriate Tools method; return a string result.
 
@@ -104,16 +133,31 @@ async def dispatch_tool(name: str, tool_input: object, tools: Tools) -> str:
     ``tool_result`` and can self-correct on the next turn, which matches
     Architecture.md §6.4's "validation failures feed back into the agent
     loop" — the same principle applies to tool failures.
+
+    Emits one INFO log line per call so an operator running ``greenbean run``
+    can see live what the agent is asking for; tool errors come back as a
+    WARNING log line (in addition to being returned to the model).
     """
+    logger.info("  %s", _format_tool_call(name, tool_input))
     try:
-        return await _dispatch(name, tool_input, tools)
+        result = await _dispatch(name, tool_input, tools)
     except KeyError as e:
         # Missing required input key — the model called the tool without a
         # required argument. Make this readable rather than a bare ``'path'``.
-        return f"error calling {name}: missing required argument {e}"
+        message = f"error calling {name}: missing required argument {e}"
+        logger.warning("    %s", message)
+        return message
     except Exception as e:
-        message = str(e) or type(e).__name__
-        return f"error calling {name}: {message}"
+        rendered = str(e) or type(e).__name__
+        message = f"error calling {name}: {rendered}"
+        logger.warning("    %s", message)
+        return message
+    if result.startswith("error calling"):
+        # ``_dispatch`` itself doesn't currently raise on unknown tools — it
+        # returns a string. Surface that too so unknown-tool noise shows up
+        # in the same place as raised errors.
+        logger.warning("    %s", result.splitlines()[0])
+    return result
 
 
 async def _dispatch(name: str, tool_input: object, tools: Tools) -> str:

@@ -8,6 +8,7 @@ end_turn. The last TextBlock in the final response is the generated document.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,9 +25,18 @@ from greenbean.core.llm import (
 from greenbean.core.planning import Document
 from greenbean.core.tools import Tools
 
+logger = logging.getLogger(__name__)
+
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
 _MAX_TOKENS = 8192
 _MAX_TURNS = 30
+
+# ``end_turn`` and ``tool_use`` are the two normal terminations of an agent
+# turn. Anything else (``max_tokens``, ``stop_sequence``, ``pause_turn``, …)
+# means the model didn't get to say what it wanted to — likely we truncated
+# output, hit a refusal, or the SDK surfaced something we don't yet handle.
+# Worth a warning so operators notice without having to dig.
+_NORMAL_STOP_REASONS = frozenset({"end_turn", "tool_use"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +121,13 @@ class Generator:
             total_input += response.usage.input_tokens
             total_output += response.usage.output_tokens
             last_content = list(response.content)
+
+            if response.stop_reason not in _NORMAL_STOP_REASONS:
+                logger.warning(
+                    "unexpected stop_reason %r for %s — output may be truncated",
+                    response.stop_reason,
+                    doc.path_in_repo,
+                )
 
             messages.append(AssistantMessage(content=response.content))
 
