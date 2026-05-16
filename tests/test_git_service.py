@@ -174,6 +174,137 @@ def test_diff_returns_empty_for_same_sha(tmp_path: Path) -> None:
     assert paths == ()
 
 
+def test_rev_parse_resolves_named_ref(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run("git", "init", "-q", "-b", "main", str(repo))
+    _run("git", "-C", str(repo), "config", "user.email", "test@example.com")
+    _run("git", "-C", str(repo), "config", "user.name", "test")
+    (repo / "x.py").write_text("x\n")
+    _run("git", "-C", str(repo), "add", "x.py")
+    _run("git", "-C", str(repo), "commit", "-q", "-m", "init")
+    expected = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    got = asyncio.run(GitService().rev_parse(repo, "main"))
+    assert got == expected
+
+
+def test_rev_parse_unknown_ref_raises(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run("git", "init", "-q", "-b", "main", str(repo))
+    _run("git", "-C", str(repo), "config", "user.email", "test@example.com")
+    _run("git", "-C", str(repo), "config", "user.name", "test")
+    (repo / "x.py").write_text("x\n")
+    _run("git", "-C", str(repo), "add", "x.py")
+    _run("git", "-C", str(repo), "commit", "-q", "-m", "init")
+
+    with pytest.raises(GitError):
+        asyncio.run(GitService().rev_parse(repo, "no-such-branch"))
+
+
+def test_is_clean_true_when_no_changes(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run("git", "init", "-q", "-b", "main", str(repo))
+    _run("git", "-C", str(repo), "config", "user.email", "test@example.com")
+    _run("git", "-C", str(repo), "config", "user.name", "test")
+    (repo / "x.py").write_text("x\n")
+    _run("git", "-C", str(repo), "add", "x.py")
+    _run("git", "-C", str(repo), "commit", "-q", "-m", "init")
+
+    assert asyncio.run(GitService().is_clean(repo)) is True
+
+
+def test_is_clean_false_when_unstaged_changes(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run("git", "init", "-q", "-b", "main", str(repo))
+    _run("git", "-C", str(repo), "config", "user.email", "test@example.com")
+    _run("git", "-C", str(repo), "config", "user.name", "test")
+    (repo / "x.py").write_text("x\n")
+    _run("git", "-C", str(repo), "add", "x.py")
+    _run("git", "-C", str(repo), "commit", "-q", "-m", "init")
+    (repo / "x.py").write_text("x changed\n")
+
+    assert asyncio.run(GitService().is_clean(repo)) is False
+
+
+def test_is_clean_false_when_untracked_file(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run("git", "init", "-q", "-b", "main", str(repo))
+    _run("git", "-C", str(repo), "config", "user.email", "test@example.com")
+    _run("git", "-C", str(repo), "config", "user.name", "test")
+    (repo / "x.py").write_text("x\n")
+    _run("git", "-C", str(repo), "add", "x.py")
+    _run("git", "-C", str(repo), "commit", "-q", "-m", "init")
+    (repo / "untracked.py").write_text("new file\n")
+
+    assert asyncio.run(GitService().is_clean(repo)) is False
+
+
+def test_is_ancestor_true_for_real_ancestor(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run("git", "init", "-q", "-b", "main", str(repo))
+    _run("git", "-C", str(repo), "config", "user.email", "test@example.com")
+    _run("git", "-C", str(repo), "config", "user.name", "test")
+    (repo / "x.py").write_text("x\n")
+    _run("git", "-C", str(repo), "add", "x.py")
+    _run("git", "-C", str(repo), "commit", "-q", "-m", "init")
+    first = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    (repo / "y.py").write_text("y\n")
+    _run("git", "-C", str(repo), "add", "y.py")
+    _run("git", "-C", str(repo), "commit", "-q", "-m", "second")
+    second = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    assert asyncio.run(GitService().is_ancestor(repo, first, second)) is True
+    # Reverse: second is not an ancestor of first.
+    assert asyncio.run(GitService().is_ancestor(repo, second, first)) is False
+
+
+def test_is_ancestor_false_for_diverged_commits(tmp_path: Path) -> None:
+    """Two branches with a shared root then independent commits — neither is
+    an ancestor of the other."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run("git", "init", "-q", "-b", "main", str(repo))
+    _run("git", "-C", str(repo), "config", "user.email", "test@example.com")
+    _run("git", "-C", str(repo), "config", "user.name", "test")
+    (repo / "x.py").write_text("x\n")
+    _run("git", "-C", str(repo), "add", "x.py")
+    _run("git", "-C", str(repo), "commit", "-q", "-m", "root")
+    _run("git", "-C", str(repo), "checkout", "-q", "-b", "branch-a")
+    (repo / "a.py").write_text("a\n")
+    _run("git", "-C", str(repo), "add", "a.py")
+    _run("git", "-C", str(repo), "commit", "-q", "-m", "on a")
+    a_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    _run("git", "-C", str(repo), "checkout", "-q", "main")
+    (repo / "b.py").write_text("b\n")
+    _run("git", "-C", str(repo), "add", "b.py")
+    _run("git", "-C", str(repo), "commit", "-q", "-m", "on main")
+    b_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+    assert asyncio.run(GitService().is_ancestor(repo, a_sha, b_sha)) is False
+    assert asyncio.run(GitService().is_ancestor(repo, b_sha, a_sha)) is False
+
+
 def test_remote_url_raises_when_remote_missing(tmp_path: Path) -> None:
     repo = tmp_path / "norems"
     repo.mkdir()

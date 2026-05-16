@@ -12,7 +12,7 @@ the same pipeline body (see ``greenbean.sync.run_pipeline``).
     greenbean plan list <repo-path> [--state PATH]
     greenbean generate <repo-path> [--state PATH] [--doc DOC_PATH]
                                    [--dry-run] [--model MODEL]
-    greenbean run <repo-path> [--state PATH] [--model MODEL]
+    greenbean run <repo-path> [--state PATH] [--model MODEL] [--pull]
     greenbean watch <repo-path> [--interval 5m] [--state PATH] [--model MODEL]
 
 The token comes from ``--token`` or ``$GITHUB_TOKEN``. If no token is
@@ -197,6 +197,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--model",
         default=None,
         help="Anthropic model override (default: $GREENBEAN_GENERATOR_MODEL or claude-sonnet-4-6).",
+    )
+    run_cmd.add_argument(
+        "--pull",
+        action="store_true",
+        help=(
+            "Before running, git fetch and fast-forward HEAD to its upstream "
+            "(skipped if local has unique commits or the working tree is dirty)."
+        ),
     )
 
     watch_cmd = sub.add_parser(
@@ -427,6 +435,50 @@ def _summary_line(summary: RunSummary) -> str:
     )
 
 
+async def _advance_to_upstream(
+    git: GitService, repo_path: Path
+) -> str | None:
+    """Fast-forward HEAD to its upstream's HEAD if safe; return the new sha.
+
+    Three guards, in order:
+
+    1. **An upstream is configured.** ``git rev-parse @{u}`` fails for repos
+       with no tracking branch (local-only fixtures, detached HEAD). We
+       treat that as a silent no-op — it's the normal state for non-cloned
+       working copies.
+    2. **The advance is a true fast-forward.** If local has commits the
+       upstream doesn't, ``current`` won't be an ancestor of ``target`` —
+       resetting would destroy that work. Skip with a warning.
+    3. **The working tree is clean.** If the user has uncommitted edits in
+       the working copy, ``reset --hard`` would obliterate them. Skip with
+       a warning.
+
+    Callers should have already ``git fetch``'d so the ``@{u}`` ref is fresh.
+    """
+    try:
+        target = await git.rev_parse(repo_path, "@{u}")
+    except GitError:
+        return None
+    current = await git.current_sha(repo_path)
+    if target == current:
+        return None
+    if not await git.is_ancestor(repo_path, current, target):
+        logger.warning(
+            "local HEAD %s has commits not on upstream %s; skipping fast-forward",
+            current[:8],
+            target[:8],
+        )
+        return None
+    if not await git.is_clean(repo_path):
+        logger.warning(
+            "working tree has uncommitted changes; skipping fast-forward to %s",
+            target[:8],
+        )
+        return None
+    await git.reset_hard(repo_path, target)
+    return target
+
+
 async def _build_pipeline_inputs(
     args: argparse.Namespace,
 ) -> tuple[Path, Path, GitService, DefaultPlanner, Generator, Path, str] | None:
@@ -462,6 +514,23 @@ async def _run(args: argparse.Namespace) -> int:
     if deps is None:
         return 1
     repo_path, state_path, git, planner, generator, output_root, model = deps
+
+    if args.pull:
+        has_remote = True
+        try:
+            await git.remote_url(repo_path)
+        except GitError:
+            has_remote = False
+        if not has_remote:
+            logger.warning("--pull skipped: no remote configured on this working copy")
+        else:
+            try:
+                await git.fetch(repo_path)
+                advanced = await _advance_to_upstream(git, repo_path)
+                if advanced is not None:
+                    logger.info("advanced HEAD to %s", advanced[:8])
+            except GitError as e:
+                logger.warning("--pull failed: %s", e)
 
     try:
         with SqliteDocStore(state_path) as store:
@@ -513,6 +582,9 @@ async def _watch(args: argparse.Namespace) -> int:
             if has_remote:
                 try:
                     await git.fetch(repo_path)
+                    advanced = await _advance_to_upstream(git, repo_path)
+                    if advanced is not None:
+                        logger.info("advanced HEAD to %s", advanced[:8])
                 except GitError as e:
                     logger.warning("fetch failed: %s", e)
             try:

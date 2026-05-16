@@ -112,6 +112,50 @@ class GitService:
         out = await self._run("-C", str(repo_path), "rev-parse", "HEAD")
         return out.strip()
 
+    async def rev_parse(self, repo_path: Path, ref: str) -> str:
+        """Resolve any ref to its commit sha.
+
+        Useful for fetched upstream refs like ``"@{u}"`` (the current
+        branch's upstream tracking branch) or named remotes like
+        ``"origin/main"`` — both common after ``fetch``.
+        """
+        out = await self._run("-C", str(repo_path), "rev-parse", ref)
+        return out.strip()
+
+    async def is_clean(self, repo_path: Path) -> bool:
+        """True iff the working tree has no uncommitted changes.
+
+        Wraps ``git status --porcelain`` — empty output means clean. Used
+        as the safety guard before fast-forwarding: we never overwrite a
+        user's in-flight edits.
+        """
+        out = await self._run("-C", str(repo_path), "status", "--porcelain")
+        return not out.strip()
+
+    async def is_ancestor(
+        self, repo_path: Path, ancestor: str, descendant: str
+    ) -> bool:
+        """True iff ``ancestor`` is reachable from ``descendant``.
+
+        The fast-forward check before ``reset --hard``: we only advance
+        HEAD when the upstream is strictly ahead — i.e. our local HEAD
+        is an ancestor of the upstream. If the histories have diverged
+        (local has unique commits), this is False and the caller skips.
+        Exits 0 / non-zero per ``git merge-base --is-ancestor``.
+        """
+        try:
+            await self._run(
+                "-C",
+                str(repo_path),
+                "merge-base",
+                "--is-ancestor",
+                ancestor,
+                descendant,
+            )
+            return True
+        except GitError:
+            return False
+
     async def log(
         self,
         repo_path: Path,
