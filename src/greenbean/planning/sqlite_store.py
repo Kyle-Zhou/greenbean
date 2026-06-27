@@ -38,7 +38,15 @@ CREATE TABLE IF NOT EXISTS document_sources (
   PRIMARY KEY (document_id, source_path)
 );
 CREATE INDEX IF NOT EXISTS idx_doc_sources_path ON document_sources(source_path);
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 """
+
+# Repo-level sync state lives in ``meta`` as a single row. The state file is
+# already per-working-copy, so one key suffices — no repo_id needed in CLI mode.
+_LAST_SYNCED_SHA = "last_synced_sha"
 
 
 def _row_to_document(row: sqlite3.Row) -> Document:
@@ -214,6 +222,27 @@ class SqliteDocStore:
                     results.append(_row_to_document(row))
 
         return tuple(results)
+
+    # ----- sync state --------------------------------------------------------
+
+    def get_last_synced_sha(self) -> str | None:
+        """The SHA this repo was last processed at, or ``None`` if never.
+
+        The run pipeline's idempotency anchor: if HEAD still equals this, the
+        repo hasn't moved since the last run and there's nothing to do.
+        """
+        row = self._con.execute(
+            "SELECT value FROM meta WHERE key = ?", (_LAST_SYNCED_SHA,)
+        ).fetchone()
+        return row["value"] if row else None
+
+    def set_last_synced_sha(self, sha: str) -> None:
+        self._con.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (_LAST_SYNCED_SHA, sha),
+        )
+        self._con.commit()
 
     # ----- generation writes -------------------------------------------------
 

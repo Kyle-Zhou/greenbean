@@ -3,8 +3,8 @@
 The local-first flow: clone (or point at an existing working tree), plan,
 generate. Generated docs land in ``~/.greenbean/output/<host>/<owner>/<name>/``
 and never in the source repo — greenbean does not publish docs back to the
-customer's repo. ``run`` and ``watch`` (the full automation loop and its
-polling wrapper) plug in here next.
+customer's repo. ``run`` is the one-shot full loop (refresh plan, generate the
+docs whose sources changed, publish); ``watch`` is its polling wrapper.
 
     greenbean clone <url> [--token TOKEN] [--branch BRANCH]
                           [--dest DIR] [--depth N]
@@ -12,6 +12,8 @@ polling wrapper) plug in here next.
     greenbean plan list <repo-path> [--state PATH]
     greenbean generate <repo-path> [--state PATH] [--doc DOC_PATH]
                                    [--dry-run] [--model MODEL]
+    greenbean run <repo-path> [--state PATH] [--full] [--dry-run] [--model M]
+    greenbean watch <repo-path> [--interval 5m] [--state PATH] [--model M]
 
 The token comes from ``--token`` or ``$GITHUB_TOKEN``. If no token is
 supplied, the bare URL is used — fine for public repos, ``file://`` URLs
@@ -23,9 +25,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import io
 import os
 import sys
-import tempfile
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 from greenbean.agent import Generator
@@ -33,92 +36,108 @@ from greenbean.connectors.github import url as github_url
 from greenbean.connectors.github.token_credentials import TokenCredentials
 from greenbean.core.connectors import RepoRef
 from greenbean.core.git import GitError, GitService
-from greenbean.core.planning import PlannedDoc
+from greenbean.pipeline import DocGenerator, GeneratorFactory, RunResult, run_once
 from greenbean.planning import DefaultPlanner, SqliteDocStore
+from greenbean.publish import (
+    DEFAULT_OUTPUT_ROOT,
+    atomic_write_text as _atomic_write_text,
+    output_root_for as _output_root_for,
+    safe_output_path as _safe_output_path,
+)
 from greenbean.settings import Settings
 from greenbean.tools.working_copy import WorkingCopyTools
 
 DEFAULT_CACHE_ROOT = Path.home() / ".greenbean" / "cache"
-DEFAULT_OUTPUT_ROOT = Path.home() / ".greenbean" / "output"
 _DEFAULT_STATE_NAME = ".greenbean/state.sqlite"
+_DEFAULT_WATCH_INTERVAL = "5m"
+
+# Publishing helpers moved to ``greenbean.publish`` so the run pipeline can
+# share them without importing ``cli``. Re-exported here under their original
+# names for the commands (and tests) that already reference them; ``__all__``
+# marks them as explicit re-exports so mypy's no-implicit-reexport is satisfied.
+__all__ = [
+    "DEFAULT_OUTPUT_ROOT",
+    "_atomic_write_text",
+    "_output_root_for",
+    "_safe_output_path",
+    "main",
+]
 
 
-def _atomic_write_text(path: Path, content: str) -> None:
-    """Write ``content`` to ``path`` atomically.
+def _make_generator_factory(model: str, settings: Settings) -> GeneratorFactory:
+    """Bind a generator-builder to a model + client for the run pipeline."""
 
-    Writes to a uniquely-named sibling temp file then ``os.replace``s into
-    position. The temp lives on the same filesystem as the target so the
-    rename is atomic on POSIX. Prevents partial files on disk-full, SIGTERM
-    mid-write, or crash. The unique temp name also keeps two concurrent
-    callers (two processes, future parallel generation) from clobbering
-    each other's in-flight write.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f"{path.name}.",
-        suffix=".tmp",
-        dir=path.parent,
-    )
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(content)
-        os.replace(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-
-
-def _safe_output_path(output_root: Path, path_in_repo: str) -> Path:
-    """Resolve ``path_in_repo`` under ``output_root``; reject any escape.
-
-    Symmetric with ``WorkingCopyTools._resolve_safe`` on the read side. The
-    plan's ``path_in_repo`` is trusted today (the mechanical planner only
-    emits clean relative paths), but the planner gains a small-LLM
-    refinement step in the build order — at which point this is the right
-    place to catch a hallucinated ``../../etc/passwd``.
-    """
-    if Path(path_in_repo).is_absolute():
-        raise ValueError(f"path_in_repo must be relative, got {path_in_repo!r}")
-    output_root = output_root.resolve()
-    candidate = (output_root / path_in_repo).resolve()
-    if candidate != output_root and output_root not in candidate.parents:
-        raise ValueError(
-            f"path_in_repo escapes the output root: {path_in_repo!r}"
+    def factory(repo_path: Path) -> DocGenerator:
+        return Generator(
+            WorkingCopyTools(repo_path),
+            model=model,
+            client=settings.make_generator_client(),
         )
-    return candidate
+
+    return factory
 
 
-def _local_namespace(repo_path: Path) -> str:
-    """Name unique per working-copy path, derived from basename + path hash.
+def _resolve_repo_and_state(args: argparse.Namespace) -> tuple[Path, Path]:
+    """Resolve the working-copy path and its state file from common args.
 
-    Two repos with the same directory name (a common case — every test
-    fixture is "repo", every dev tree is "myproject") would otherwise
-    collide under ``_local/`` and silently overwrite each other's docs.
+    The ``--state`` override is absolute; otherwise the state file lives at
+    ``<repo-path>/.greenbean/state.sqlite``. Shared by every repo-scoped
+    command so the defaulting can't drift between them.
     """
-    resolved = repo_path.resolve()
-    digest = hashlib.sha256(str(resolved).encode()).hexdigest()[:8]
-    return f"{resolved.name}-{digest}"
+    repo_path = Path(args.repo_path).expanduser().resolve()
+    if args.state:
+        state_path = Path(args.state).expanduser().resolve()
+    else:
+        state_path = repo_path / _DEFAULT_STATE_NAME
+    return repo_path, state_path
 
 
-async def _output_root_for(repo_path: Path, git: GitService) -> Path:
-    """Resolve where generated docs for ``repo_path`` should land.
+def _add_no_llm_flag(p: argparse.ArgumentParser) -> None:
+    """Attach the shared ``--no-llm`` dev switch to a subcommand parser."""
+    p.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="Use canned fake responses instead of any LLM API (no network, no cost).",
+    )
 
-    Reads ``origin``'s URL and parses it as a GitHub repo. Falls back to
-    ``_local/<basename>-<path-hash>`` when the working copy has no origin
-    or its URL isn't a recognizable GitHub URL — keeps local fixtures and
-    file:// clones working, while avoiding collisions between different
-    repos that happen to share a directory name.
+
+def _apply_no_llm(args: argparse.Namespace) -> None:
+    """Honour ``--no-llm`` by flipping the env var Settings.from_env reads."""
+    if getattr(args, "no_llm", False):
+        os.environ["GREENBEAN_NO_LLM"] = "1"
+
+
+def _parse_interval(value: str) -> float:
+    """Parse a poll interval like ``30s``, ``5m``, ``1h``, or bare seconds.
+
+    Returns seconds as a float. Raises ``ValueError`` on anything unparseable
+    so the CLI can report a clean error instead of a stack trace.
     """
+    text = value.strip().lower()
+    units = {"s": 1, "m": 60, "h": 3600}
+    unit = units.get(text[-1:])
+    number = text[:-1] if unit is not None else text
     try:
-        remote = await git.remote_url(repo_path)
-    except GitError:
-        remote = ""
-    if remote:
-        parsed = github_url.try_parse(remote)
-        if parsed is not None:
-            return DEFAULT_OUTPUT_ROOT / "github.com" / parsed.owner / parsed.name
-    return DEFAULT_OUTPUT_ROOT / "_local" / _local_namespace(repo_path)
+        seconds = float(number) * (unit if unit is not None else 1)
+    except ValueError:
+        raise ValueError(
+            f"invalid interval {value!r}: expected e.g. 30s, 5m, 1h, or seconds"
+        ) from None
+    if seconds <= 0:
+        raise ValueError(f"interval must be positive: {value!r}")
+    return seconds
+
+
+def _parse_port(value: str) -> int:
+    """Parse a viewer port, accepting both ``8080`` and ``:8080`` forms."""
+    text = value.strip().lstrip(":")
+    try:
+        port = int(text)
+    except ValueError:
+        raise ValueError(f"invalid port {value!r}") from None
+    if not (1 <= port <= 65535):
+        raise ValueError(f"port out of range: {port}")
+    return port
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -194,6 +213,54 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Anthropic model override (default: $GREENBEAN_GENERATOR_MODEL or claude-sonnet-4-6).",
     )
+    _add_no_llm_flag(gen)
+
+    run = sub.add_parser(
+        "run",
+        help="Run one pass of the loop: refresh the plan, generate changed docs, publish.",
+    )
+    run.add_argument("repo_path", help="Path to a git working copy.")
+    run.add_argument(
+        "--state",
+        default=None,
+        help="SQLite state file (default: <repo-path>/.greenbean/state.sqlite).",
+    )
+    run.add_argument(
+        "--full",
+        action="store_true",
+        help="Regenerate every planned doc, ignoring the diff (force a full pass).",
+    )
+    run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Generate but write nothing; leaves sync state untouched.",
+    )
+    run.add_argument("--model", default=None, help="Anthropic model override.")
+    _add_no_llm_flag(run)
+
+    watch = sub.add_parser(
+        "watch",
+        help="Poll a working copy on an interval and run the loop when HEAD moves.",
+    )
+    watch.add_argument("repo_path", help="Path to a git working copy.")
+    watch.add_argument(
+        "--interval",
+        default=_DEFAULT_WATCH_INTERVAL,
+        help=f"Poll interval, e.g. 30s / 5m / 1h (default: {_DEFAULT_WATCH_INTERVAL}).",
+    )
+    watch.add_argument(
+        "--state",
+        default=None,
+        help="SQLite state file (default: <repo-path>/.greenbean/state.sqlite).",
+    )
+    watch.add_argument("--model", default=None, help="Anthropic model override.")
+    watch.add_argument(
+        "--view",
+        default=None,
+        metavar="PORT",
+        help="Serve a localhost markdown viewer for the output dir (e.g. 8080 or :8080).",
+    )
+    _add_no_llm_flag(watch)
 
     return parser
 
@@ -243,8 +310,7 @@ async def _clone(args: argparse.Namespace) -> int:
 
 
 async def _plan_init(args: argparse.Namespace) -> int:
-    repo_path = Path(args.repo_path).expanduser().resolve()
-    state_path = Path(args.state).expanduser().resolve() if args.state else repo_path / _DEFAULT_STATE_NAME
+    repo_path, state_path = _resolve_repo_and_state(args)
 
     git = GitService()
     try:
@@ -254,11 +320,7 @@ async def _plan_init(args: argparse.Namespace) -> int:
         return 1
 
     planner = DefaultPlanner()
-    specs = await planner.initial_plan(repo_path)
-    planned: list[PlannedDoc] = []
-    for spec in specs:
-        sources = await planner.source_files_for(repo_path, spec)
-        planned.append(PlannedDoc(spec=spec, source_paths=list(sources)))
+    planned = await planner.plan_with_sources(repo_path)
 
     state_path.parent.mkdir(parents=True, exist_ok=True)
     with SqliteDocStore(state_path) as store:
@@ -272,8 +334,7 @@ async def _plan_init(args: argparse.Namespace) -> int:
 
 
 def _plan_list(args: argparse.Namespace) -> int:
-    repo_path = Path(args.repo_path).expanduser().resolve()
-    state_path = Path(args.state).expanduser().resolve() if args.state else repo_path / _DEFAULT_STATE_NAME
+    _repo_path, state_path = _resolve_repo_and_state(args)
 
     if not state_path.exists():
         print(f"error: state file not found: {state_path}", file=sys.stderr)
@@ -295,14 +356,14 @@ def _plan_list(args: argparse.Namespace) -> int:
 
 
 async def _generate(args: argparse.Namespace) -> int:
-    repo_path = Path(args.repo_path).expanduser().resolve()
-    state_path = Path(args.state).expanduser().resolve() if args.state else repo_path / _DEFAULT_STATE_NAME
+    repo_path, state_path = _resolve_repo_and_state(args)
 
     if not state_path.exists():
         print(f"error: state file not found: {state_path}", file=sys.stderr)
         print("hint: run `greenbean plan init` first", file=sys.stderr)
         return 1
 
+    _apply_no_llm(args)
     settings = Settings.from_env()
     model = args.model or settings.generator_model
     git = GitService()
@@ -354,6 +415,126 @@ async def _generate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_run_summary(result: RunResult) -> None:
+    """One-line outcome for a pipeline pass (skips already logged inline)."""
+    if result.skipped:
+        return
+    mode = "full" if result.full else "incremental"
+    print(
+        f"{mode} pass at {result.after_sha[:8]}: "
+        f"generated {len(result.generated)} doc(s)"
+    )
+    if result.generated:
+        print(f"  -> {result.output_root}")
+
+
+async def _advance_to_upstream(git: GitService, repo_path: Path) -> None:
+    """Fetch and fast-forward the working copy to its upstream, safely.
+
+    Best-effort: a missing remote (offline, no origin) is ignored. Never
+    resets a dirty tree — a developer's uncommitted work is sacred, so if the
+    upstream moved while there are local changes, leave HEAD alone and let the
+    pipeline react to whatever is committed.
+    """
+    try:
+        await git.fetch(repo_path)
+    except GitError:
+        return  # no remote / offline — fall through to current HEAD
+    target = await git.upstream_sha(repo_path)
+    if target is None or target == await git.current_sha(repo_path):
+        return
+    if await git.is_dirty(repo_path):
+        print("upstream moved but working tree is dirty — not resetting")
+        return
+    await git.reset_hard(repo_path, target)
+    print(f"advanced working copy to {target[:8]}")
+
+
+async def _run(args: argparse.Namespace) -> int:
+    repo_path, state_path = _resolve_repo_and_state(args)
+
+    _apply_no_llm(args)
+    settings = Settings.from_env()
+    model = args.model or settings.generator_model
+    try:
+        result = await run_once(
+            repo_path,
+            state_path,
+            git=GitService(),
+            planner=DefaultPlanner(),
+            make_generator=_make_generator_factory(model, settings),
+            dry_run=args.dry_run,
+            force_full=args.full,
+        )
+    except GitError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    _print_run_summary(result)
+    return 0
+
+
+async def _watch(args: argparse.Namespace) -> int:
+    repo_path, state_path = _resolve_repo_and_state(args)
+
+    try:
+        interval = _parse_interval(args.interval)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    # watch is a long-lived streaming command; line-buffer so progress shows
+    # promptly when stdout is redirected to a file/pipe (e.g. in CI), not just
+    # on a TTY. Affects every print below, including the pipeline's log lines.
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(line_buffering=True)
+
+    _apply_no_llm(args)
+    settings = Settings.from_env()
+    model = args.model or settings.generator_model
+    git = GitService()
+    planner = DefaultPlanner()
+    factory = _make_generator_factory(model, settings)
+
+    viewer: ThreadingHTTPServer | None = None
+    if args.view is not None:
+        try:
+            port = _parse_port(args.view)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        from greenbean.viewer import start_viewer
+
+        try:
+            viewer = start_viewer(DEFAULT_OUTPUT_ROOT, port)
+        except OSError as e:
+            print(f"error: could not start viewer on port {port}: {e}", file=sys.stderr)
+            return 2
+        print(f"viewer: http://127.0.0.1:{port}/")
+
+    print(f"watching {repo_path} every {args.interval} (Ctrl-C to stop)")
+    try:
+        while True:
+            try:
+                await _advance_to_upstream(git, repo_path)
+                result = await run_once(
+                    repo_path,
+                    state_path,
+                    git=git,
+                    planner=planner,
+                    make_generator=factory,
+                )
+                _print_run_summary(result)
+            except GitError as e:
+                print(f"error: {e}", file=sys.stderr)
+            await asyncio.sleep(interval)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("\nstopped")
+        return 0
+    finally:
+        if viewer is not None:
+            viewer.shutdown()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "clone":
@@ -365,6 +546,10 @@ def main(argv: list[str] | None = None) -> int:
             return _plan_list(args)
     if args.command == "generate":
         return asyncio.run(_generate(args))
+    if args.command == "run":
+        return asyncio.run(_run(args))
+    if args.command == "watch":
+        return asyncio.run(_watch(args))
     return 1
 
 

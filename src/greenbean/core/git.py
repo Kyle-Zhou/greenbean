@@ -112,6 +112,43 @@ class GitService:
         out = await self._run("-C", str(repo_path), "rev-parse", "HEAD")
         return out.strip()
 
+    async def changed_files(
+        self, repo_path: Path, before_sha: str, after_sha: str
+    ) -> Sequence[str]:
+        """Repo-relative paths that differ between two commits.
+
+        ``git diff --name-only <before> <after>`` — added, modified, and
+        deleted paths (a deletion reports its old path). This is the input to
+        the planning layer's ``affected_docs`` reverse lookup: given what
+        changed, which docs depend on it.
+        """
+        out = await self._run(
+            "-C", str(repo_path), "diff", "--name-only", before_sha, after_sha
+        )
+        return tuple(line for line in out.splitlines() if line.strip())
+
+    async def is_dirty(self, repo_path: Path) -> bool:
+        """True if the working tree has uncommitted changes (tracked or not).
+
+        ``watch`` consults this before fast-forwarding a working copy: never
+        ``reset --hard`` over a developer's in-progress edits.
+        """
+        out = await self._run("-C", str(repo_path), "status", "--porcelain")
+        return bool(out.strip())
+
+    async def upstream_sha(self, repo_path: Path) -> str | None:
+        """SHA of the current branch's upstream (``@{u}``), or ``None``.
+
+        Returns ``None`` when no upstream is configured — e.g. a pure local
+        dev tree with no tracking branch. ``watch`` uses this to decide
+        whether there's a remote head to advance toward after a fetch.
+        """
+        try:
+            out = await self._run("-C", str(repo_path), "rev-parse", "@{u}")
+        except GitError:
+            return None
+        return out.strip()
+
     async def log(
         self,
         repo_path: Path,

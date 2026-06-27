@@ -11,10 +11,13 @@ The customer's source repo is read-only input. Generated docs land in `~/.greenb
 ## Module map
 
 - `src/greenbean/cli.py`
-  - v1 entrypoints: `greenbean clone`, `greenbean plan init|list`, `greenbean generate`.
-  - `_output_root_for(repo_path, git)` resolves the per-repo output root from the working copy's `origin` URL; falls back to `_local/<basename>-<path-hash>` for unrecognized remotes (the hash suffix prevents collisions when two working copies share a directory name).
-  - `_atomic_write_text` writes generated content via `tempfile.mkstemp` + `os.replace` so partial writes don't corrupt the output dir.
-  - `greenbean run` and `greenbean watch` (the full automation loop) are next — see Architecture.md §12 step 5.
+  - v1 entrypoints: `greenbean clone`, `greenbean plan init|list`, `greenbean generate`, `greenbean run`, `greenbean watch`.
+  - `run` calls `pipeline.run_once` for a single pass; `watch` polls on an interval (`_parse_interval`), fast-forwards the working copy to its upstream when clean (`_advance_to_upstream` — never resets a dirty tree), and re-runs the pipeline when HEAD moves.
+  - Publishing helpers (`_output_root_for`, `_safe_output_path`, `_atomic_write_text`) are re-exported from `greenbean.publish`.
+- `src/greenbean/pipeline.py`
+  - `run_once(...)` — the shared **pipeline body** (sync plan → resolve diff to affected docs → generate → publish → record `last_synced_sha`). Idempotent: HEAD unchanged since the last run is a no-op; first run generates the whole plan, later runs diff `last_synced_sha → HEAD` and regenerate only `affected_docs`. The recorded SHA advances only after a successful pass. `DocGenerator` is a `Protocol` so the loop is testable with a stub instead of a live model.
+- `src/greenbean/publish.py`
+  - Output-path resolution (`output_root_for`, `safe_output_path`, `local_namespace`) and `atomic_write_text` (`tempfile.mkstemp` + `os.replace`). Lives here, not in `cli`, so `pipeline` can share it without a circular import.
 - `src/greenbean/core/connectors.py`
   - Platform abstraction boundary.
   - Defines `RepoCredentials` — the **only** connector-layer protocol. No `ChangeNotifier` (both deployment modes poll, see Architecture.md §10.1), no `RepoWriter` (greenbean does not publish back to the source repo).

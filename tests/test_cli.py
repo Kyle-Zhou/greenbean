@@ -255,3 +255,34 @@ def test_atomic_write_uses_unique_temp_names(
     tmps = sorted(tmp_path.iterdir())
     assert len(tmps) == 3, f"expected 3 unique temp files, got {tmps}"
     assert len({t.name for t in tmps}) == 3
+
+
+# ----- _parse_interval -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("30s", 30.0), ("5m", 300.0), ("1h", 3600.0), ("45", 45.0), ("2.5m", 150.0)],
+)
+def test_parse_interval_accepts_units(value: str, expected: float) -> None:
+    assert cli._parse_interval(value) == expected
+
+
+@pytest.mark.parametrize("value", ["0s", "-5m", "0", "abc", ""])
+def test_parse_interval_rejects_invalid(value: str) -> None:
+    with pytest.raises(ValueError):
+        cli._parse_interval(value)
+
+
+# ----- _parse_port -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(("value", "expected"), [("8080", 8080), (":8080", 8080), (" :80 ", 80)])
+def test_parse_port_accepts_forms(value: str, expected: int) -> None:
+    assert cli._parse_port(value) == expected
+
+
+@pytest.mark.parametrize("value", ["0", "70000", "-1", "abc", ":", ""])
+def test_parse_port_rejects_invalid(value: str) -> None:
+    with pytest.raises(ValueError):
+        cli._parse_port(value)

@@ -233,6 +233,35 @@ def test_source_paths_for_no_sources_returns_empty() -> None:
         assert store.source_paths_for(doc.id) == ()
 
 
+# ----- sync state ------------------------------------------------------------
+
+
+def test_last_synced_sha_none_before_set() -> None:
+    with _store() as store:
+        assert store.get_last_synced_sha() is None
+
+
+def test_last_synced_sha_round_trips() -> None:
+    with _store() as store:
+        store.set_last_synced_sha(SHA_A)
+        assert store.get_last_synced_sha() == SHA_A
+
+
+def test_last_synced_sha_overwrites() -> None:
+    with _store() as store:
+        store.set_last_synced_sha(SHA_A)
+        store.set_last_synced_sha(SHA_B)
+        assert store.get_last_synced_sha() == SHA_B
+
+
+def test_last_synced_sha_persists_across_reopen(tmp_path: Path) -> None:
+    state = tmp_path / "state.sqlite"
+    with SqliteDocStore(state) as store:
+        store.set_last_synced_sha(SHA_A)
+    with SqliteDocStore(state) as store:
+        assert store.get_last_synced_sha() == SHA_A
+
+
 # ----- context manager -------------------------------------------------------
 
 
