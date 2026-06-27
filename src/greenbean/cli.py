@@ -24,19 +24,27 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import io
 import os
 import sys
+import urllib.parse
+from collections.abc import Sequence
+from datetime import datetime
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from greenbean.agent import Generator
 from greenbean.connectors.github import url as github_url
 from greenbean.connectors.github.token_credentials import TokenCredentials
 from greenbean.core.connectors import RepoRef
-from greenbean.core.git import GitError, GitService
+from greenbean.core.git import Commit, GitError, GitService
 from greenbean.pipeline import DocGenerator, GeneratorFactory, RunResult, run_once
+
+if TYPE_CHECKING:
+    from greenbean.viewer import StatusHolder, ViewerStatus
 from greenbean.planning import DefaultPlanner, SqliteDocStore
 from greenbean.publish import (
     DEFAULT_OUTPUT_ROOT,
@@ -450,6 +458,97 @@ async def _advance_to_upstream(git: GitService, repo_path: Path) -> None:
     print(f"advanced working copy to {target[:8]}")
 
 
+def _display_remote(raw: str) -> str:
+    """Strip any embedded credentials from a remote URL before showing it."""
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme in ("http", "https") and "@" in parsed.netloc:
+        host = parsed.hostname or ""
+        if parsed.port:
+            host = f"{host}:{parsed.port}"
+        return urllib.parse.urlunparse((parsed.scheme, host, parsed.path, "", "", ""))
+    return raw
+
+
+async def _build_status(
+    git: GitService,
+    repo_path: Path,
+    interval_label: str,
+    interval_seconds: float,
+    result: RunResult,
+) -> ViewerStatus:
+    """Assemble the viewer's status snapshot from git + the last run.
+
+    Best-effort: each git lookup is guarded so a transient failure degrades a
+    single field to ``None`` rather than breaking the panel. GitHub remotes get
+    browsable web URLs (repo + commit); other remotes are shown credential-free.
+    """
+    from greenbean.viewer import ViewerStatus
+
+    branch: str | None = None
+    with contextlib.suppress(GitError):
+        branch = await git.current_branch(repo_path)
+
+    head_sha: str | None = None
+    head_short: str | None = None
+    subject: str | None = None
+    author: str | None = None
+    head_time: str | None = None
+    commits: Sequence[Commit] = ()
+    try:
+        commits = await git.log(repo_path, limit=1)
+    except GitError:
+        commits = ()
+    if commits:
+        c = commits[0]
+        head_sha = c.sha
+        head_short = c.sha[:8]
+        subject = c.message.splitlines()[0] if c.message.strip() else None
+        author = c.author
+        head_time = c.timestamp.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    repo_url: str | None = None
+    repo_web: str | None = None
+    commit_web: str | None = None
+    try:
+        raw_remote = await git.remote_url(repo_path)
+    except GitError:
+        raw_remote = ""
+    if raw_remote:
+        parsed = github_url.try_parse(raw_remote)
+        if parsed is not None:
+            repo_web = f"https://github.com/{parsed.owner}/{parsed.name}"
+            repo_url = repo_web
+            if head_sha:
+                commit_web = f"{repo_web}/commit/{head_sha}"
+        else:
+            repo_url = _display_remote(raw_remote)
+
+    if result.skipped:
+        outcome = "up to date (no change)"
+    elif result.full:
+        outcome = f"full generation — {len(result.generated)} doc(s)"
+    else:
+        outcome = f"incremental — {len(result.generated)} doc(s)"
+
+    now = datetime.now().astimezone()
+    return ViewerStatus(
+        repo_path=str(repo_path),
+        repo_url=repo_url,
+        repo_web_url=repo_web,
+        branch=branch,
+        head_short=head_short,
+        head_subject=subject,
+        head_author=author,
+        head_time=head_time,
+        commit_web_url=commit_web,
+        last_sync=now.strftime("%Y-%m-%d %H:%M:%S %Z"),
+        next_sync_epoch=now.timestamp() + interval_seconds,
+        interval=interval_label,
+        last_outcome=outcome,
+        output_root=str(DEFAULT_OUTPUT_ROOT),
+    )
+
+
 async def _run(args: argparse.Namespace) -> int:
     repo_path, state_path = _resolve_repo_and_state(args)
 
@@ -496,16 +595,18 @@ async def _watch(args: argparse.Namespace) -> int:
     factory = _make_generator_factory(model, settings)
 
     viewer: ThreadingHTTPServer | None = None
+    status_holder: StatusHolder | None = None
     if args.view is not None:
         try:
             port = _parse_port(args.view)
         except ValueError as e:
             print(f"error: {e}", file=sys.stderr)
             return 2
-        from greenbean.viewer import start_viewer
+        from greenbean.viewer import StatusHolder, start_viewer
 
+        status_holder = StatusHolder()
         try:
-            viewer = start_viewer(DEFAULT_OUTPUT_ROOT, port)
+            viewer = start_viewer(DEFAULT_OUTPUT_ROOT, port, status_holder)
         except OSError as e:
             print(f"error: could not start viewer on port {port}: {e}", file=sys.stderr)
             return 2
@@ -524,6 +625,12 @@ async def _watch(args: argparse.Namespace) -> int:
                     make_generator=factory,
                 )
                 _print_run_summary(result)
+                if status_holder is not None:
+                    status_holder.set(
+                        await _build_status(
+                            git, repo_path, args.interval, interval, result
+                        )
+                    )
             except GitError as e:
                 print(f"error: {e}", file=sys.stderr)
             await asyncio.sleep(interval)

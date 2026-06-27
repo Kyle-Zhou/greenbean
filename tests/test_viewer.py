@@ -7,13 +7,33 @@ server on an ephemeral port (0) and fetching over the loopback.
 from __future__ import annotations
 
 import http.client
+import json
 import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from greenbean.viewer import _resolve_under, start_viewer
+from greenbean.viewer import StatusHolder, ViewerStatus, _resolve_under, start_viewer
+
+
+def _sample_status() -> ViewerStatus:
+    return ViewerStatus(
+        repo_path="/x/repo",
+        repo_url="https://github.com/o/r",
+        repo_web_url="https://github.com/o/r",
+        branch="main",
+        head_short="abc12345",
+        head_subject="fix things",
+        head_author="Dev",
+        head_time="2026-06-28 10:00:00 UTC",
+        commit_web_url="https://github.com/o/r/commit/abc12345deadbeef",
+        last_sync="2026-06-28 10:00:00 UTC",
+        next_sync_epoch=1_700_000_000.0,
+        interval="5m",
+        last_outcome="incremental — 2 doc(s)",
+        output_root="/home/.greenbean/output",
+    )
 
 
 def test_resolve_under_allows_nested_path(tmp_path: Path) -> None:
@@ -92,3 +112,48 @@ def test_traversal_request_does_not_escape_root(served: tuple[str, Path]) -> Non
     body = resp.read().decode("utf-8")
     conn.close()
     assert "secret" not in body  # never served, whether normalized or rejected
+
+
+def test_status_panel_present_without_status(served: tuple[str, Path]) -> None:
+    base, _ = served
+    assert "watch status" in _get(base + "/")
+
+
+def test_status_json_empty_without_holder(served: tuple[str, Path]) -> None:
+    base, _ = served
+    assert json.loads(_get(base + "/__status")) == {}
+
+
+# ----- status panel (with a holder) ------------------------------------------
+
+
+@pytest.fixture
+def served_with_status(tmp_path: Path) -> Iterator[str]:
+    root = tmp_path / "output"
+    (root / "github.com" / "o" / "r").mkdir(parents=True)
+    (root / "github.com" / "o" / "r" / "README.md").write_text("# Title\n")
+
+    holder = StatusHolder()
+    holder.set(_sample_status())
+    server = start_viewer(root, 0, holder)
+    port = server.server_address[1]
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.shutdown()
+
+
+def test_status_json_reflects_holder(served_with_status: str) -> None:
+    data = json.loads(_get(served_with_status + "/__status"))
+    assert data["branch"] == "main"
+    assert data["commit_web_url"].endswith("/commit/abc12345deadbeef")
+    assert data["last_outcome"] == "incremental — 2 doc(s)"
+    assert data["next_sync_epoch"] == 1_700_000_000.0
+
+
+def test_index_renders_status_fields(served_with_status: str) -> None:
+    body = _get(served_with_status + "/")
+    assert "watch status" in body
+    assert "github.com/o/r" in body  # repo link
+    assert "abc12345" in body  # commit short sha
+    assert "fix things" in body  # commit subject

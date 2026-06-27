@@ -18,6 +18,9 @@ The customer's source repo is read-only input. Generated docs land in `~/.greenb
   - `run_once(...)` — the shared **pipeline body** (sync plan → resolve diff to affected docs → generate → publish → record `last_synced_sha`). Idempotent: HEAD unchanged since the last run is a no-op; first run generates the whole plan, later runs diff `last_synced_sha → HEAD` and regenerate only `affected_docs`. The recorded SHA advances only after a successful pass. `DocGenerator` is a `Protocol` so the loop is testable with a stub instead of a live model.
 - `src/greenbean/publish.py`
   - Output-path resolution (`output_root_for`, `safe_output_path`, `local_namespace`) and `atomic_write_text` (`tempfile.mkstemp` + `os.replace`). Lives here, not in `cli`, so `pipeline` can share it without a circular import.
+- `src/greenbean/viewer.py`
+  - The `watch --view :PORT` localhost markdown viewer (Architecture §8.2): a stdlib `http.server` in a daemon thread, no web framework. Renders `.md` via the `markdown` lib (see `docs/adr/0001-markdown-viewer.md`), serves an index of all generated docs, and auto-refreshes open pages on file change (`/__mtime` poll).
+  - **Watch status panel.** `ViewerStatus` is a snapshot (repo + browsable URLs, branch, current commit + commit URL, last/next sync, interval, last outcome) the watch loop pushes into a thread-safe `StatusHolder` each tick; the index renders it and a small client poll of `/__status` keeps it live (with a countdown to the next sync). `cli._build_status` assembles the snapshot; GitHub remotes get web links, other remotes are shown credential-free.
 - `src/greenbean/core/connectors.py`
   - Platform abstraction boundary.
   - Defines `RepoCredentials` — the **only** connector-layer protocol. No `ChangeNotifier` (both deployment modes poll, see Architecture.md §10.1), no `RepoWriter` (greenbean does not publish back to the source repo).

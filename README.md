@@ -29,6 +29,13 @@ uv run greenbean watch <repo-path> --interval 5m     # poll + re-run when HEAD m
 
 Generated docs land in `~/.greenbean/output/<host>/<owner>/<name>/`.
 
+Two flags on `run` control a pass:
+
+- `--full` — regenerate every doc instead of only the ones whose sources changed.
+- `--dry-run` — print generated docs to stdout; write nothing and don't advance sync state.
+
+They're independent; `--full --dry-run` previews a full regen without touching disk.
+
 ## Dev mode (no LLM, no API cost)
 
 Exercise the full pipeline — planning, diffing, publishing, state — without calling

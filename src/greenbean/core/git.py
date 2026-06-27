@@ -127,6 +127,15 @@ class GitService:
         )
         return tuple(line for line in out.splitlines() if line.strip())
 
+    async def current_branch(self, repo_path: Path) -> str:
+        """Current branch name, or ``"HEAD"`` when detached.
+
+        ``git rev-parse --abbrev-ref HEAD`` — used for surfacing what the
+        working copy is tracking (e.g. in the viewer's status panel).
+        """
+        out = await self._run("-C", str(repo_path), "rev-parse", "--abbrev-ref", "HEAD")
+        return out.strip()
+
     async def is_dirty(self, repo_path: Path) -> bool:
         """True if the working tree has uncommitted changes (tracked or not).
 
