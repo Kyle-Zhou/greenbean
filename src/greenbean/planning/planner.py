@@ -9,7 +9,7 @@ import asyncio
 from collections.abc import Sequence
 from pathlib import Path
 
-from greenbean.core.planning import DocSpec
+from greenbean.core.planning import DocSpec, PlannedDoc
 
 _SOURCE_EXTENSIONS = frozenset(
     {
@@ -135,6 +135,20 @@ class DefaultPlanner:
                 )
 
         return specs
+
+    async def plan_with_sources(self, repo_path: Path) -> list[PlannedDoc]:
+        """Build the full plan plus each doc's source-file map in one pass.
+
+        The unit of work both ``plan init`` and the run pipeline need: an
+        ``initial_plan`` followed by a ``source_files_for`` resolution per
+        spec. Kept here so the two callers can't drift.
+        """
+        specs = await self.initial_plan(repo_path)
+        planned: list[PlannedDoc] = []
+        for spec in specs:
+            sources = await self.source_files_for(repo_path, spec)
+            planned.append(PlannedDoc(spec=spec, source_paths=list(sources)))
+        return planned
 
     async def source_files_for(self, repo_path: Path, doc: DocSpec) -> Sequence[str]:
         return await asyncio.to_thread(self._source_files_for_sync, repo_path, doc)

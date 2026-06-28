@@ -135,3 +135,84 @@ def test_remote_url_raises_when_remote_missing(tmp_path: Path) -> None:
 
     with pytest.raises(GitError):
         asyncio.run(git.remote_url(repo))
+
+
+# ----- changed_files / is_dirty / upstream_sha -------------------------------
+
+
+def _init_work_repo(path: Path) -> None:
+    path.mkdir()
+    _run("git", "init", "-q", "-b", "main", str(path))
+    _run("git", "-C", str(path), "config", "user.email", "test@example.com")
+    _run("git", "-C", str(path), "config", "user.name", "test")
+
+
+def _commit(path: Path, message: str) -> str:
+    _run("git", "-C", str(path), "add", "-A")
+    _run("git", "-C", str(path), "commit", "-q", "-m", message)
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_changed_files_lists_added_modified_and_deleted(tmp_path: Path) -> None:
+    repo = tmp_path / "wc"
+    _init_work_repo(repo)
+    (repo / "keep.py").write_text("x = 1\n")
+    (repo / "gone.py").write_text("y = 2\n")
+    before = _commit(repo, "init")
+
+    (repo / "keep.py").write_text("x = 2\n")  # modified
+    (repo / "new.py").write_text("z = 3\n")  # added
+    (repo / "gone.py").unlink()  # deleted
+    after = _commit(repo, "change")
+
+    changed = asyncio.run(GitService().changed_files(repo, before, after))
+
+    assert set(changed) == {"keep.py", "new.py", "gone.py"}
+
+
+def test_changed_files_empty_for_same_sha(tmp_path: Path) -> None:
+    repo = tmp_path / "wc"
+    _init_work_repo(repo)
+    (repo / "a.py").write_text("x = 1\n")
+    sha = _commit(repo, "init")
+
+    assert asyncio.run(GitService().changed_files(repo, sha, sha)) == ()
+
+
+def test_is_dirty_reflects_uncommitted_changes(tmp_path: Path) -> None:
+    repo = tmp_path / "wc"
+    _init_work_repo(repo)
+    (repo / "a.py").write_text("x = 1\n")
+    _commit(repo, "init")
+    git = GitService()
+
+    assert asyncio.run(git.is_dirty(repo)) is False
+
+    (repo / "a.py").write_text("x = 2\n")
+    assert asyncio.run(git.is_dirty(repo)) is True
+
+
+def test_upstream_sha_none_without_tracking_branch(tmp_path: Path) -> None:
+    repo = tmp_path / "wc"
+    _init_work_repo(repo)
+    (repo / "a.py").write_text("x = 1\n")
+    _commit(repo, "init")
+
+    assert asyncio.run(GitService().upstream_sha(repo)) is None
+
+
+def test_upstream_sha_returns_remote_head_after_fetch(
+    remote_repo: tuple[Path, str], tmp_path: Path
+) -> None:
+    bare, expected_sha = remote_repo
+    dest = tmp_path / "checkout"
+    git = GitService()
+
+    asyncio.run(git.clone(str(bare), dest, depth=1, branch="main"))
+
+    assert asyncio.run(git.upstream_sha(dest)) == expected_sha
