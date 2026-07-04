@@ -11,6 +11,14 @@ from dataclasses import dataclass
 from typing import Any, Protocol, Sequence
 
 
+class LLMError(RuntimeError):
+    """A provider-agnostic LLM failure (auth, rate limit, bad request, ...).
+
+    Implementations wrap their SDK's exceptions in this so callers can handle
+    model failures without importing or knowing about a specific provider.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class TextBlock:
     text: str
@@ -30,6 +38,7 @@ ContentBlock = TextBlock | ToolUseBlock
 class ToolResult:
     tool_use_id: str
     content: str
+    is_error: bool = False
 
 
 @dataclass(frozen=True, slots=True)

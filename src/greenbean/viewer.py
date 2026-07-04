@@ -40,16 +40,42 @@ table { border-collapse: collapse; } td, th { border: 1px solid #ddd;
 .gb-status td:first-child { color: #64748b; width: 9rem; font-size: .9em; }
 .gb-dot { display: inline-block; width: .6rem; height: .6rem; border-radius: 50%;
    background: #22c55e; margin-right: .4rem; }
+.gb-dot-off { background: #cbd5e1; }
+.gb-docs { width: 100%; border-collapse: collapse; }
+.gb-docs th { text-align: left; color: #64748b; font-weight: 600; font-size: .85em;
+   border: none; border-bottom: 1px solid #e2e8f0; padding: .35rem .4rem; }
+.gb-docs td { border: none; border-bottom: 1px solid #f1f5f9; padding: .35rem .4rem;
+   font-size: .92em; }
 """
 
 
 @dataclass(frozen=True, slots=True)
-class ViewerStatus:
-    """A snapshot of what ``watch`` is doing, rendered in the status panel.
+class DocStatus:
+    """Per-doc generation status for the index table.
 
-    All fields are plain JSON-serializable types so the snapshot doubles as the
-    ``/__status`` payload the page polls. Times are pre-formatted for display;
-    the ``*_epoch`` fields drive the client-side countdown.
+    Sourced from the SQLite store, not the disk listing, so it can report docs
+    that are planned but not yet generated. ``href`` is the doc's URL path under
+    the viewer root (``<repo-namespace>/<path_in_repo>``) when it's viewable, or
+    ``None`` when nothing's been written to disk for it yet.
+    """
+
+    path: str
+    href: str | None
+    last_generated: str | None
+    model: str | None
+    tokens: str | None
+    generated: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ViewerStatus:
+    """A snapshot of what a run is doing, rendered in the status panel.
+
+    Shared by ``watch`` (the poll loop) and ``generate`` (one-shot); ``mode``
+    selects which sync-specific fields the panel shows. All fields are plain
+    JSON-serializable types so the snapshot doubles as the ``/__status`` payload
+    the page polls. Times are pre-formatted for display; the ``*_epoch`` fields
+    drive the client-side countdown.
     """
 
     repo_path: str
@@ -66,6 +92,8 @@ class ViewerStatus:
     interval: str
     last_outcome: str | None
     output_root: str
+    mode: str = "watch"
+    docs: tuple[DocStatus, ...] = ()
 
 
 class StatusHolder:
@@ -119,12 +147,15 @@ def _txt(value: str | None) -> str:
 
 
 def _status_panel(status: ViewerStatus | None) -> str:
-    """Render the watch-status panel.
+    """Render the run-status panel for the current mode.
 
     Server-renders the latest snapshot (so it works without JS); the same cell
-    ids are refreshed live by ``_status_script`` polling ``/__status``.
+    ids are refreshed live by ``_status_script`` polling ``/__status``. The
+    sync-cadence rows (next sync, interval) only make sense for ``watch`` and
+    are dropped under ``generate``.
     """
     s = status
+    mode = s.mode if s else "watch"
     repo = _link_html(
         (s.repo_url or s.repo_path) if s else None, s.repo_web_url if s else None
     )
@@ -136,18 +167,19 @@ def _status_panel(status: ViewerStatus | None) -> str:
         ("message", "gb-subject", _txt(s.head_subject if s else None)),
         ("author", "gb-author", _txt(s.head_author if s else None)),
         ("committed", "gb-time", _txt(s.head_time if s else None)),
-        ("last sync", "gb-last", _txt(s.last_sync if s else None)),
-        ("next sync", "gb-next", "—"),
-        ("interval", "gb-interval", _txt(s.interval if s else None)),
-        ("last result", "gb-outcome", _txt(s.last_outcome if s else None)),
-        ("output dir", "gb-output", _txt(s.output_root if s else None)),
+        ("last run", "gb-last", _txt(s.last_sync if s else None)),
     ]
+    if mode == "watch":
+        rows.append(("next sync", "gb-next", "—"))
+        rows.append(("interval", "gb-interval", _txt(s.interval if s else None)))
+    rows.append(("last result", "gb-outcome", _txt(s.last_outcome if s else None)))
+    rows.append(("output dir", "gb-output", _txt(s.output_root if s else None)))
     cells = "".join(
         f'<tr><td>{label}</td><td id="{cid}">{val}</td></tr>'
         for label, cid, val in rows
     )
     return (
-        '<section class="gb-status"><h2><span class="gb-dot"></span>watch status</h2>'
+        f'<section class="gb-status"><h2><span class="gb-dot"></span>{mode} status</h2>'
         f"<table>{cells}</table></section>"
     )
 
@@ -163,6 +195,18 @@ def _status_script() -> str:
         "function gbLink(id,v,href){var e=document.getElementById(id);if(!e)return;"
         "if(v&&href){e.innerHTML='';var a=document.createElement('a');a.href=href;"
         "a.textContent=v;e.appendChild(a);}else{gbSet(id,v);}}"
+        "function gbCell(v){var td=document.createElement('td');"
+        "td.textContent=(v===null||v===undefined||v==='')?'\\u2014':v;return td;}"
+        "function gbDocs(docs){var b=document.getElementById('gb-docs');"
+        "if(!b||!docs)return;b.innerHTML='';for(var i=0;i<docs.length;i++){var x=docs[i];"
+        "var tr=document.createElement('tr');var nd=document.createElement('td');"
+        "if(x.href){var a=document.createElement('a');a.href='/'+encodeURI(x.href);"
+        "a.textContent=x.path;nd.appendChild(a);}else{nd.textContent=x.path;}tr.appendChild(nd);"
+        "tr.appendChild(gbCell(x.last_generated));tr.appendChild(gbCell(x.model));"
+        "tr.appendChild(gbCell(x.tokens));var sd=document.createElement('td');"
+        "var dot=document.createElement('span');dot.className='gb-dot'+(x.generated?'':' gb-dot-off');"
+        "sd.appendChild(dot);sd.appendChild(document.createTextNode("
+        "x.generated?'current':'not generated'));tr.appendChild(sd);b.appendChild(tr);}}"
         "var gbNext=null;"
         "async function gbPoll(){try{var r=await fetch('/__status');var d=await r.json();"
         "gbLink('gb-repo',d.repo_url||d.repo_path,d.repo_web_url);gbSet('gb-branch',d.branch);"
@@ -170,7 +214,7 @@ def _status_script() -> str:
         "gbSet('gb-author',d.head_author);gbSet('gb-time',d.head_time);"
         "gbSet('gb-last',d.last_sync);gbSet('gb-interval',d.interval);"
         "gbSet('gb-outcome',d.last_outcome);gbSet('gb-output',d.output_root);"
-        "gbNext=d.next_sync_epoch;}catch(e){}}"
+        "gbDocs(d.docs);gbNext=d.next_sync_epoch;}catch(e){}}"
         "function gbTick(){var e=document.getElementById('gb-next');"
         "if(e&&gbNext)e.textContent='in '+gbDur(gbNext-Date.now()/1000);}"
         f"setInterval(gbPoll,{_STATUS_MS});setInterval(gbTick,1000);gbPoll();"
@@ -178,18 +222,49 @@ def _status_script() -> str:
     )
 
 
-def _index_body(root: Path, status: ViewerStatus | None) -> str:
-    panel = _status_panel(status)
+def _doc_dot(generated: bool) -> str:
+    if generated:
+        return '<span class="gb-dot"></span>current'
+    return '<span class="gb-dot gb-dot-off"></span>not generated'
+
+
+def _doc_row(d: DocStatus) -> str:
+    name = _link_html(d.path, f"/{quote(d.href)}" if d.href else None)
+    return (
+        f"<tr><td>{name}</td><td>{_txt(d.last_generated)}</td>"
+        f"<td>{_txt(d.model)}</td><td>{_txt(d.tokens)}</td>"
+        f"<td>{_doc_dot(d.generated)}</td></tr>"
+    )
+
+
+def _docs_table(root: Path, status: ViewerStatus | None) -> str:
+    """Per-doc generation status, from the store snapshot when available.
+
+    Falls back to a plain disk listing of the whole output dir when there's no
+    status (no ``--view`` holder, or status not pushed yet) — that keeps the
+    cross-repo browse working and matches the viewer's standalone behaviour.
+    """
+    if status and status.docs:
+        rows = "".join(_doc_row(d) for d in status.docs)
+        return (
+            "<h1>greenbean docs</h1>"
+            '<table class="gb-docs"><thead><tr>'
+            "<th>doc</th><th>last generated</th><th>model</th>"
+            "<th>tokens</th><th>status</th></tr></thead>"
+            f'<tbody id="gb-docs">{rows}</tbody></table>'
+        )
     docs = sorted(p for p in root.rglob("*.md") if p.is_file()) if root.exists() else []
     if docs:
         items = "".join(
             f'<li><a href="/{quote(rel)}">{html_lib.escape(rel)}</a></li>'
             for rel in (d.relative_to(root).as_posix() for d in docs)
         )
-        docs_html = f"<h1>greenbean docs</h1><ul>{items}</ul>"
-    else:
-        docs_html = "<h1>greenbean docs</h1><p>No generated docs yet.</p>"
-    return panel + docs_html + _status_script()
+        return f"<h1>greenbean docs</h1><ul>{items}</ul>"
+    return "<h1>greenbean docs</h1><p>No generated docs yet.</p>"
+
+
+def _index_body(root: Path, status: ViewerStatus | None) -> str:
+    return _status_panel(status) + _docs_table(root, status) + _status_script()
 
 
 def _render_markdown(path: Path, rel: str) -> str:

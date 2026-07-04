@@ -36,6 +36,18 @@ Two flags on `run` control a pass:
 
 They're independent; `--full --dry-run` previews a full regen without touching disk.
 
+## Viewer
+
+`--view PORT` serves a localhost markdown viewer for the output dir, with a
+per-doc generation status table (last generated, model, tokens, fresh/stale).
+Works on both `generate` (serves until Ctrl-C after generating) and `watch`
+(updates live each poll):
+
+```
+uv run greenbean generate <repo-path> --view 8080
+uv run greenbean watch <repo-path> --view 8080
+```
+
 ## Dev mode (no LLM, no API cost)
 
 Exercise the full pipeline — planning, diffing, publishing, state — without calling

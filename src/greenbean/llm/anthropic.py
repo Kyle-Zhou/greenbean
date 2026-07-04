@@ -16,6 +16,7 @@ from anthropic.types import TextBlockParam
 from greenbean.core.llm import (
     AssistantMessage,
     ContentBlock,
+    LLMError,
     LLMResponse,
     Message,
     TextBlock,
@@ -25,6 +26,26 @@ from greenbean.core.llm import (
     Usage,
     UserMessage,
 )
+
+
+def _describe(e: anthropic.APIError) -> str:
+    """A concise, user-facing message for an Anthropic SDK error.
+
+    Prefers the human-readable string the API returns in the error body
+    (``{"error": {"message": ...}}``) over the SDK's ``.message``, which embeds
+    the whole raw response.
+    """
+    detail: str | None = None
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            detail = err.get("message")
+    detail = detail or getattr(e, "message", None) or str(e)
+    status = getattr(e, "status_code", None)
+    if status:
+        return f"Anthropic API error ({status}): {detail}"
+    return f"Anthropic API request failed: {detail}"
 
 
 def _to_anthropic_tool(t: ToolDefinition) -> dict[str, Any]:
@@ -38,7 +59,15 @@ def _to_anthropic_message(msg: Message) -> dict[str, Any]:
         return {
             "role": "user",
             "content": [
-                {"type": "tool_result", "tool_use_id": r.tool_use_id, "content": r.content}
+                {
+                    "type": "tool_result",
+                    "tool_use_id": r.tool_use_id,
+                    # The API rejects an empty tool_result content string, so a
+                    # tool that legitimately returns nothing (empty file, empty
+                    # directory) gets a placeholder instead of failing the turn.
+                    "content": r.content or "(empty result)",
+                    "is_error": r.is_error,
+                }
                 for r in msg.content
             ],
         }
@@ -80,13 +109,16 @@ class AnthropicClient:
         system_blocks: list[TextBlockParam] = [
             TextBlockParam(type="text", text=system, cache_control={"type": "ephemeral"})
         ]
-        response = await self._client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            system=system_blocks,
-            tools=[_to_anthropic_tool(t) for t in tools],  # type: ignore[arg-type]
-            messages=[_to_anthropic_message(m) for m in messages],  # type: ignore[arg-type]
-        )
+        try:
+            response = await self._client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system_blocks,
+                tools=[_to_anthropic_tool(t) for t in tools],  # type: ignore[arg-type]
+                messages=[_to_anthropic_message(m) for m in messages],  # type: ignore[arg-type]
+            )
+        except anthropic.APIError as e:
+            raise LLMError(_describe(e)) from e
         return LLMResponse(
             content=_from_anthropic_content(list(response.content)),
             stop_reason=response.stop_reason or "end_turn",

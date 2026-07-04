@@ -14,7 +14,13 @@ from pathlib import Path
 
 import pytest
 
-from greenbean.viewer import StatusHolder, ViewerStatus, _resolve_under, start_viewer
+from greenbean.viewer import (
+    DocStatus,
+    StatusHolder,
+    ViewerStatus,
+    _resolve_under,
+    start_viewer,
+)
 
 
 def _sample_status() -> ViewerStatus:
@@ -33,6 +39,44 @@ def _sample_status() -> ViewerStatus:
         interval="5m",
         last_outcome="incremental — 2 doc(s)",
         output_root="/home/.greenbean/output",
+    )
+
+
+def _generate_status() -> ViewerStatus:
+    return ViewerStatus(
+        repo_path="/x/repo",
+        repo_url=None,
+        repo_web_url=None,
+        branch="main",
+        head_short="abc12345",
+        head_subject="fix things",
+        head_author="Dev",
+        head_time="2026-06-28 10:00:00 UTC",
+        commit_web_url=None,
+        last_sync="2026-06-28 10:00:00 UTC",
+        next_sync_epoch=None,
+        interval="",
+        last_outcome="generated 2 doc(s)",
+        output_root="/home/.greenbean/output",
+        mode="generate",
+        docs=(
+            DocStatus(
+                path="README.md",
+                href="github.com/o/r/README.md",
+                last_generated="2026-06-28 10:00:00 UTC",
+                model="claude-sonnet-4-6",
+                tokens="406+85",
+                generated=True,
+            ),
+            DocStatus(
+                path="CONTRIBUTING.md",
+                href=None,
+                last_generated=None,
+                model=None,
+                tokens=None,
+                generated=False,
+            ),
+        ),
     )
 
 
@@ -157,3 +201,42 @@ def test_index_renders_status_fields(served_with_status: str) -> None:
     assert "github.com/o/r" in body  # repo link
     assert "abc12345" in body  # commit short sha
     assert "fix things" in body  # commit subject
+
+
+# ----- per-doc table + generate mode -----------------------------------------
+
+
+@pytest.fixture
+def served_generate(tmp_path: Path) -> Iterator[str]:
+    root = tmp_path / "output"
+    (root / "github.com" / "o" / "r").mkdir(parents=True)
+    (root / "github.com" / "o" / "r" / "README.md").write_text("# Title\n")
+
+    holder = StatusHolder()
+    holder.set(_generate_status())
+    server = start_viewer(root, 0, holder)
+    port = server.server_address[1]
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.shutdown()
+
+
+def test_generate_mode_panel_and_per_doc_table(served_generate: str) -> None:
+    body = _get(served_generate + "/")
+    assert "generate status" in body  # mode-aware header
+    assert "next sync" not in body  # sync-cadence rows dropped under generate
+    # per-doc table: a generated doc (with metadata) and a not-yet-generated one
+    assert 'id="gb-docs"' in body
+    assert "README.md" in body and "claude-sonnet-4-6" in body and "406+85" in body
+    assert "CONTRIBUTING.md" in body and "not generated" in body
+
+
+def test_status_json_includes_docs(served_generate: str) -> None:
+    data = json.loads(_get(served_generate + "/__status"))
+    assert data["mode"] == "generate"
+    assert data["next_sync_epoch"] is None
+    paths = {d["path"]: d for d in data["docs"]}
+    assert paths["README.md"]["generated"] is True
+    assert paths["README.md"]["href"] == "github.com/o/r/README.md"
+    assert paths["CONTRIBUTING.md"]["generated"] is False

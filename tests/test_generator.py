@@ -276,6 +276,57 @@ def test_generate_raises_on_max_turns_exceeded() -> None:
         asyncio.run(gen.generate(_make_doc(), source_paths=[]))
 
 
+# ----- Generator.generate: a failing tool is fed back, not fatal -------------
+
+
+def test_generate_tool_error_is_fed_back_not_raised() -> None:
+    """A tool that raises is reported to the model as an error result and the
+    run continues — it must not abort generation."""
+    from greenbean.core.tools import RipgrepNotInstalled
+
+    class _RaisingTools(_StubTools):
+        async def grep(
+            self,
+            pattern: str,
+            *,
+            path: str | None = None,
+            ignore_case: bool = False,
+            max_results: int | None = None,
+        ) -> Sequence[GrepHit]:
+            raise RipgrepNotInstalled("ripgrep not on PATH")
+
+    responses = iter(
+        [
+            _make_response(
+                [_tool_use_block("grep", {"pattern": "x"})], stop_reason="tool_use"
+            ),
+            _make_response([_text_block("recovered")], stop_reason="end_turn"),
+        ]
+    )
+    captured_messages: list[Any] = []
+
+    async def _send(self: Any, **kwargs: Any) -> LLMResponse:
+        # Snapshot — the generator mutates the same list across turns.
+        captured_messages.append(list(kwargs["messages"]))
+        return next(responses)
+
+    class _Client:
+        send_messages = _send
+
+    gen = Generator(_RaisingTools(), model="test", client=_Client())
+    result = asyncio.run(gen.generate(_make_doc(), source_paths=[]))
+
+    assert result.content == "recovered"
+    assert result.tool_calls == 1
+    # The second request must carry the error back to the model as a tool result.
+    tool_result_msg = captured_messages[1][-1]
+    assert isinstance(tool_result_msg, UserMessage)
+    fed_back = tool_result_msg.content[0]
+    assert isinstance(fed_back, ToolResult)
+    assert fed_back.is_error is True
+    assert "RipgrepNotInstalled" in fed_back.content
+
+
 # ----- Generator.generate: source paths forwarded to initial message ---------
 
 
