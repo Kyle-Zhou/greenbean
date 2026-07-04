@@ -20,6 +20,7 @@ import pytest
 
 from greenbean import cli
 from greenbean.core.git import GitService
+from greenbean.settings import Settings
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not on PATH")
 
@@ -286,3 +287,33 @@ def test_parse_port_accepts_forms(value: str, expected: int) -> None:
 def test_parse_port_rejects_invalid(value: str) -> None:
     with pytest.raises(ValueError):
         cli._parse_port(value)
+
+
+# ----- _llm_preflight --------------------------------------------------------
+
+
+def _settings(provider: str) -> Settings:
+    return Settings(
+        generator_provider=provider,
+        generator_model="m",
+        triage_provider=provider,
+        triage_model="m",
+    )
+
+
+def test_llm_preflight_flags_missing_anthropic_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    msg = cli._llm_preflight(_settings("anthropic"))
+    assert msg is not None and "ANTHROPIC_API_KEY" in msg
+
+
+def test_llm_preflight_ok_with_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    assert cli._llm_preflight(_settings("anthropic")) is None
+
+
+def test_llm_preflight_ok_for_fake_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert cli._llm_preflight(_settings("fake")) is None

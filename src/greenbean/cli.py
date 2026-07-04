@@ -11,9 +11,10 @@ docs whose sources changed, publish); ``watch`` is its polling wrapper.
     greenbean plan init <repo-path> [--state PATH]
     greenbean plan list <repo-path> [--state PATH]
     greenbean generate <repo-path> [--state PATH] [--doc DOC_PATH]
-                                   [--dry-run] [--model MODEL]
+                                   [--dry-run] [--model MODEL] [--view PORT]
     greenbean run <repo-path> [--state PATH] [--full] [--dry-run] [--model M]
     greenbean watch <repo-path> [--interval 5m] [--state PATH] [--model M]
+                                [--view PORT]
 
 The token comes from ``--token`` or ``$GITHUB_TOKEN``. If no token is
 supplied, the bare URL is used — fine for public repos, ``file://`` URLs
@@ -27,7 +28,9 @@ import asyncio
 import contextlib
 import hashlib
 import io
+import logging
 import os
+import sqlite3
 import sys
 import urllib.parse
 from collections.abc import Sequence
@@ -36,15 +39,17 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from greenbean.agent import Generator
+from greenbean.agent import Generator, GeneratorError
 from greenbean.connectors.github import url as github_url
 from greenbean.connectors.github.token_credentials import TokenCredentials
 from greenbean.core.connectors import RepoRef
 from greenbean.core.git import Commit, GitError, GitService
+from greenbean.core.llm import LLMError
+from greenbean.observability import configure_logging
 from greenbean.pipeline import DocGenerator, GeneratorFactory, RunResult, run_once
 
 if TYPE_CHECKING:
-    from greenbean.viewer import StatusHolder, ViewerStatus
+    from greenbean.viewer import DocStatus, StatusHolder, ViewerStatus
 from greenbean.planning import DefaultPlanner, SqliteDocStore
 from greenbean.publish import (
     DEFAULT_OUTPUT_ROOT,
@@ -109,10 +114,70 @@ def _add_no_llm_flag(p: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_verbose_flag(p: argparse.ArgumentParser) -> None:
+    """Attach the shared ``-v/--verbose`` logging switch to a subcommand parser."""
+    p.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Verbose logging: per-turn detail and full tool inputs/outputs.",
+    )
+
+
 def _apply_no_llm(args: argparse.Namespace) -> None:
     """Honour ``--no-llm`` by flipping the env var Settings.from_env reads."""
     if getattr(args, "no_llm", False):
         os.environ["GREENBEAN_NO_LLM"] = "1"
+
+
+def _llm_preflight(settings: Settings) -> str | None:
+    """Return an actionable error if the generator client can't authenticate.
+
+    The Anthropic SDK defers a missing-key failure all the way to request time,
+    surfacing a cryptic ``TypeError`` mid-generation. Catch the common case
+    (``ANTHROPIC_API_KEY`` unset) up front so the user gets a clear message and
+    a pointer to ``--no-llm`` instead of a traceback.
+    """
+    if settings.generator_provider == "anthropic" and not os.environ.get(
+        "ANTHROPIC_API_KEY"
+    ):
+        return (
+            "ANTHROPIC_API_KEY is not set. Export it "
+            "(export ANTHROPIC_API_KEY=sk-ant-...), or pass --no-llm to run "
+            "without an API key."
+        )
+    return None
+
+
+_LLM_ERROR_HINT = (
+    "hint: verify ANTHROPIC_API_KEY and the model name, or pass --no-llm to run "
+    "without the API."
+)
+
+
+def _add_view_flag(p: argparse.ArgumentParser) -> None:
+    """Attach the shared ``--view PORT`` viewer switch to a subcommand parser."""
+    p.add_argument(
+        "--view",
+        default=None,
+        metavar="PORT",
+        help="Serve a localhost markdown viewer for the output dir (e.g. 8080 or :8080).",
+    )
+
+
+def _start_viewer(port_arg: str) -> tuple[ThreadingHTTPServer, StatusHolder]:
+    """Start the localhost viewer for ``--view``; return the server + status holder.
+
+    Raises ``ValueError`` on a bad port and ``OSError`` if the bind fails, so
+    the caller can map both to a clean exit code. Prints the URL on success.
+    """
+    from greenbean.viewer import StatusHolder, start_viewer
+
+    port = _parse_port(port_arg)
+    holder = StatusHolder()
+    server = start_viewer(DEFAULT_OUTPUT_ROOT, port, holder)
+    print(f"viewer: http://127.0.0.1:{port}/")
+    return server, holder
 
 
 def _parse_interval(value: str) -> float:
@@ -221,7 +286,9 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Anthropic model override (default: $GREENBEAN_GENERATOR_MODEL or claude-sonnet-4-6).",
     )
+    _add_view_flag(gen)
     _add_no_llm_flag(gen)
+    _add_verbose_flag(gen)
 
     run = sub.add_parser(
         "run",
@@ -245,6 +312,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument("--model", default=None, help="Anthropic model override.")
     _add_no_llm_flag(run)
+    _add_verbose_flag(run)
 
     watch = sub.add_parser(
         "watch",
@@ -262,13 +330,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="SQLite state file (default: <repo-path>/.greenbean/state.sqlite).",
     )
     watch.add_argument("--model", default=None, help="Anthropic model override.")
-    watch.add_argument(
-        "--view",
-        default=None,
-        metavar="PORT",
-        help="Serve a localhost markdown viewer for the output dir (e.g. 8080 or :8080).",
-    )
+    _add_view_flag(watch)
     _add_no_llm_flag(watch)
+    _add_verbose_flag(watch)
 
     return parser
 
@@ -371,8 +435,24 @@ async def _generate(args: argparse.Namespace) -> int:
         print("hint: run `greenbean plan init` first", file=sys.stderr)
         return 1
 
+    # Validate --view up front so a bad port fails before any generation work.
+    # With --view the command becomes long-lived (serves until Ctrl-C), so
+    # line-buffer stdout — same as watch — to keep the viewer link and progress
+    # visible promptly when output is piped, not stuck in a block buffer.
+    if args.view is not None:
+        try:
+            _parse_port(args.view)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        if isinstance(sys.stdout, io.TextIOWrapper):
+            sys.stdout.reconfigure(line_buffering=True)
+
     _apply_no_llm(args)
     settings = Settings.from_env()
+    if (msg := _llm_preflight(settings)) is not None:
+        print(f"error: {msg}", file=sys.stderr)
+        return 1
     model = args.model or settings.generator_model
     git = GitService()
     tools = WorkingCopyTools(repo_path)
@@ -395,7 +475,13 @@ async def _generate(args: argparse.Namespace) -> int:
         for doc in docs:
             source_paths = store.source_paths_for(doc.id)
             print(f"generating {doc.path_in_repo} ...", end=" ", flush=True)
-            result = await generator.generate(doc, source_paths)
+            try:
+                result = await generator.generate(doc, source_paths)
+            except (LLMError, GeneratorError) as e:
+                print(file=sys.stderr)  # close the dangling "generating ..." line
+                print(f"error: {e}", file=sys.stderr)
+                print(_LLM_ERROR_HINT, file=sys.stderr)
+                return 1
             print(
                 f"done ({result.tool_calls} tool calls, "
                 f"{result.input_tokens}+{result.output_tokens} tokens)"
@@ -420,6 +506,31 @@ async def _generate(args: argparse.Namespace) -> int:
                 )
                 print(f"  wrote {out_path}")
 
+    if args.view is None:
+        return 0
+
+    # Keep the process alive to serve the viewer (generate is otherwise
+    # one-shot, which would kill the daemon thread immediately).
+    outcome = (
+        f"dry run — {len(docs)} doc(s), nothing written"
+        if args.dry_run
+        else f"generated {len(docs)} doc(s)"
+    )
+    try:
+        viewer, status_holder = _start_viewer(args.view)
+    except (ValueError, OSError) as e:
+        print(f"error: could not start viewer: {e}", file=sys.stderr)
+        return 2
+    status_holder.set(
+        await _build_status(git, repo_path, state_path, mode="generate", outcome=outcome)
+    )
+    print("serving generated docs — Ctrl-C to stop")
+    try:
+        await asyncio.Event().wait()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("\nstopped")
+    finally:
+        viewer.shutdown()
     return 0
 
 
@@ -469,18 +580,72 @@ def _display_remote(raw: str) -> str:
     return raw
 
 
+def _run_outcome(result: RunResult) -> str:
+    """One-line result string for the status panel from a pipeline pass."""
+    if result.skipped:
+        return "up to date (no change)"
+    if result.full:
+        return f"full generation — {len(result.generated)} doc(s)"
+    return f"incremental — {len(result.generated)} doc(s)"
+
+
+def _collect_doc_statuses(state_path: Path, repo_rel: str) -> tuple[DocStatus, ...]:
+    """Per-doc generation status from the store, for the index table.
+
+    ``repo_rel`` is the repo's output subdir relative to the viewer root, so a
+    generated doc can be linked to its served page. Best-effort: a missing or
+    unreadable state file yields an empty tuple rather than breaking the panel.
+    """
+    from greenbean.viewer import DocStatus
+
+    if not state_path.exists():
+        return ()
+    out: list[DocStatus] = []
+    try:
+        with SqliteDocStore(state_path) as store:
+            for doc in store.list_documents():
+                md = doc.generation_metadata or {}
+                generated = doc.last_generated_at is not None
+                last = (
+                    doc.last_generated_at.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+                    if doc.last_generated_at is not None
+                    else None
+                )
+                it, ot = md.get("input_tokens"), md.get("output_tokens")
+                tokens = f"{it}+{ot}" if it is not None and ot is not None else None
+                href = f"{repo_rel}/{doc.path_in_repo}" if (generated and repo_rel) else None
+                out.append(
+                    DocStatus(
+                        path=doc.path_in_repo,
+                        href=href,
+                        last_generated=last,
+                        model=md.get("model"),
+                        tokens=tokens,
+                        generated=generated,
+                    )
+                )
+    except sqlite3.Error:
+        return tuple(out)
+    return tuple(out)
+
+
 async def _build_status(
     git: GitService,
     repo_path: Path,
-    interval_label: str,
-    interval_seconds: float,
-    result: RunResult,
+    state_path: Path,
+    *,
+    mode: str,
+    outcome: str,
+    interval_label: str = "",
+    interval_seconds: float | None = None,
 ) -> ViewerStatus:
-    """Assemble the viewer's status snapshot from git + the last run.
+    """Assemble the viewer's status snapshot from git + the store.
 
-    Best-effort: each git lookup is guarded so a transient failure degrades a
-    single field to ``None`` rather than breaking the panel. GitHub remotes get
-    browsable web URLs (repo + commit); other remotes are shown credential-free.
+    Shared by ``watch`` and ``generate`` via ``mode``; ``interval_*`` only apply
+    to ``watch`` (they drive the next-sync countdown). Best-effort: each git
+    lookup is guarded so a transient failure degrades a single field to ``None``
+    rather than breaking the panel. GitHub remotes get browsable web URLs (repo +
+    commit); other remotes are shown credential-free.
     """
     from greenbean.viewer import ViewerStatus
 
@@ -523,14 +688,15 @@ async def _build_status(
         else:
             repo_url = _display_remote(raw_remote)
 
-    if result.skipped:
-        outcome = "up to date (no change)"
-    elif result.full:
-        outcome = f"full generation — {len(result.generated)} doc(s)"
-    else:
-        outcome = f"incremental — {len(result.generated)} doc(s)"
+    repo_out = await _output_root_for(repo_path, git)
+    try:
+        repo_rel = repo_out.relative_to(DEFAULT_OUTPUT_ROOT).as_posix()
+    except ValueError:
+        repo_rel = ""
+    docs = _collect_doc_statuses(state_path, repo_rel)
 
     now = datetime.now().astimezone()
+    next_epoch = now.timestamp() + interval_seconds if interval_seconds is not None else None
     return ViewerStatus(
         repo_path=str(repo_path),
         repo_url=repo_url,
@@ -542,10 +708,12 @@ async def _build_status(
         head_time=head_time,
         commit_web_url=commit_web,
         last_sync=now.strftime("%Y-%m-%d %H:%M:%S %Z"),
-        next_sync_epoch=now.timestamp() + interval_seconds,
+        next_sync_epoch=next_epoch,
         interval=interval_label,
         last_outcome=outcome,
         output_root=str(DEFAULT_OUTPUT_ROOT),
+        mode=mode,
+        docs=docs,
     )
 
 
@@ -554,6 +722,9 @@ async def _run(args: argparse.Namespace) -> int:
 
     _apply_no_llm(args)
     settings = Settings.from_env()
+    if (msg := _llm_preflight(settings)) is not None:
+        print(f"error: {msg}", file=sys.stderr)
+        return 1
     model = args.model or settings.generator_model
     try:
         result = await run_once(
@@ -567,6 +738,10 @@ async def _run(args: argparse.Namespace) -> int:
         )
     except GitError as e:
         print(f"error: {e}", file=sys.stderr)
+        return 1
+    except (LLMError, GeneratorError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        print(_LLM_ERROR_HINT, file=sys.stderr)
         return 1
     _print_run_summary(result)
     return 0
@@ -589,6 +764,9 @@ async def _watch(args: argparse.Namespace) -> int:
 
     _apply_no_llm(args)
     settings = Settings.from_env()
+    if (msg := _llm_preflight(settings)) is not None:
+        print(f"error: {msg}", file=sys.stderr)
+        return 1
     model = args.model or settings.generator_model
     git = GitService()
     planner = DefaultPlanner()
@@ -598,19 +776,10 @@ async def _watch(args: argparse.Namespace) -> int:
     status_holder: StatusHolder | None = None
     if args.view is not None:
         try:
-            port = _parse_port(args.view)
-        except ValueError as e:
-            print(f"error: {e}", file=sys.stderr)
+            viewer, status_holder = _start_viewer(args.view)
+        except (ValueError, OSError) as e:
+            print(f"error: could not start viewer: {e}", file=sys.stderr)
             return 2
-        from greenbean.viewer import StatusHolder, start_viewer
-
-        status_holder = StatusHolder()
-        try:
-            viewer = start_viewer(DEFAULT_OUTPUT_ROOT, port, status_holder)
-        except OSError as e:
-            print(f"error: could not start viewer on port {port}: {e}", file=sys.stderr)
-            return 2
-        print(f"viewer: http://127.0.0.1:{port}/")
 
     print(f"watching {repo_path} every {args.interval} (Ctrl-C to stop)")
     try:
@@ -628,11 +797,22 @@ async def _watch(args: argparse.Namespace) -> int:
                 if status_holder is not None:
                     status_holder.set(
                         await _build_status(
-                            git, repo_path, args.interval, interval, result
+                            git,
+                            repo_path,
+                            state_path,
+                            mode="watch",
+                            outcome=_run_outcome(result),
+                            interval_label=args.interval,
+                            interval_seconds=interval,
                         )
                     )
             except GitError as e:
                 print(f"error: {e}", file=sys.stderr)
+            except (LLMError, GeneratorError) as e:
+                # Keep watching: a transient API failure shouldn't kill the
+                # long-lived poll loop — log it and retry on the next tick.
+                print(f"error: {e}", file=sys.stderr)
+                print(_LLM_ERROR_HINT, file=sys.stderr)
             await asyncio.sleep(interval)
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\nstopped")
@@ -642,8 +822,7 @@ async def _watch(args: argparse.Namespace) -> int:
             viewer.shutdown()
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "clone":
         return asyncio.run(_clone(args))
     if args.command == "plan":
@@ -658,6 +837,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "watch":
         return asyncio.run(_watch(args))
     return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    configure_logging(getattr(args, "verbose", False))
+    try:
+        return _dispatch(args)
+    except Exception:
+        # Anything not already handled with a clean message reaches here; log it
+        # with a traceback (via the logger, not a raw dump) so the failure and
+        # its cause are legible instead of a wall of stack frames.
+        logging.getLogger("greenbean.cli").exception("unexpected error")
+        return 1
 
 
 if __name__ == "__main__":
